@@ -17,6 +17,7 @@ categories = ["concurrency"]
 # (src, README, CHANGELOG, LICENSE) is what a user of the crate needs.
 exclude = [
     "/.cargo",
+    "/.config",
     "/.github",
     "/CLAUDE.md",
     "/CONTRIBUTING.md",

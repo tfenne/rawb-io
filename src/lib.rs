@@ -27,6 +27,11 @@
 //! is an implementation detail — the crate is named for its *behavior*, not the
 //! ring — and may change.
 //!
+//! When *not* to use this crate: streams too small to amortize a thread spawn
+//! and a ring allocation (well under a megabyte), seek-heavy access (the
+//! adapters are strictly sequential), or async runtimes (these adapters block
+//! real threads).
+//!
 //! # Examples
 //!
 //! Read-ahead: wrap any [`Read`] and consume it as usual; the kernel reads run

@@ -6,6 +6,12 @@ on:
       - main
   pull_request:
 
+# A force-push or rapid follow-up commit supersedes in-flight runs of the
+# same ref; don't burn runners finishing stale ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -131,6 +137,10 @@ jobs:
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Clippy check
         run: cargo ci-lint
+      # Build the publishable tarball (and compile from it) so packaging
+      # problems surface on every PR instead of at release time.
+      - name: Package check
+        run: cargo package --locked
 
   format:
     runs-on: ubuntu-latest

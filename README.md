@@ -1,5 +1,9 @@
 # rawb-io
 
+[![CI](https://github.com/tfenne/rawb-io/actions/workflows/check.yml/badge.svg)](https://github.com/tfenne/rawb-io/actions/workflows/check.yml)
+[![crates.io](https://img.shields.io/crates/v/rawb-io.svg)](https://crates.io/crates/rawb-io)
+[![docs.rs](https://img.shields.io/docsrs/rawb-io)](https://docs.rs/rawb-io)
+
 **R**ead-**a**head / **w**rite-**b**ehind byte IO for Rust: a `ThreadedReader` and `ThreadedWriter` that put a dedicated thread on one IO end, with a user-space byte ring buffer in between, so a pipeline stage never blocks on the kernel pipe.
 
 ## Why
@@ -12,6 +16,8 @@ In a shell pipeline — `producer | your_stage | consumer` — the only thing de
 - **Write-behind** — `ThreadedWriter` wraps a `Write` sink. Your `write` returns as soon as the bytes land in the ring, and a background thread flushes them *behind* you. When the downstream sink stalls, your stage keeps working against the buffer instead of blocking on the syscall.
 
 The result is that compute and IO overlap: the worker thread rarely waits on the kernel, and throughput on a bursty pipeline improves without changing your stage's code beyond swapping in the wrapper.
+
+When *not* to use it: streams too small to amortize a thread spawn and a ring allocation (well under a megabyte), seek-heavy access (the adapters are strictly sequential), or async runtimes (these adapters block real threads; use your runtime's IO instead). A runnable pipeline stage lives in [`examples/pipeline.rs`](examples/pipeline.rs).
 
 ## Usage
 

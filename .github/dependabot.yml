@@ -1,0 +1,12 @@
+# Weekly dependency-update PRs for the Cargo tree and for the SHA-pinned
+# GitHub Actions (the pins are deliberate; dependabot keeps them fresh).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
