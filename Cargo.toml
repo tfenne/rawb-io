@@ -1,0 +1,19 @@
+[package]
+name = "rawb-io"
+version = "0.1.0"
+authors = ["Tim Fennell <tfenne@tfenne.com>"]
+description = "Read-ahead / write-behind byte IO: threaded Reader/Writer that decouples a pipeline stage from the kernel pipe via a background thread and a byte ring buffer."
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/tfenne/rawb-io"
+repository = "https://github.com/tfenne/rawb-io"
+keywords = ["io", "buffer", "thread", "spsc", "pipe"]
+categories = ["concurrency", "asynchronous"]
+# Keep the CI tree out of the published tarball; everything else is needed to
+# build and use the crate.
+exclude = ["/.github"]
+
+[dependencies]
+ringbuf = "0.5"

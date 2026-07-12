@@ -1,0 +1,84 @@
+# Contributing to rawb-io
+
+Thanks for your interest in rawb-io. This document covers the dev loop, code-style expectations, the release flow, and conventions for contributors and maintainers.
+
+## Getting Started
+
+**Prerequisites:**
+- Rust stable, minimum version from `rust-toolchain.toml` / `Cargo.toml`'s `rust-version` field (currently **1.89**).
+- [`cargo-nextest`][nextest] for the test runner used in CI.
+- [`cargo-deny`][cargo-deny] for the supply-chain check (optional locally; CI runs it on every PR).
+
+The test suite needs no external tools — everything runs in-process.
+
+```sh
+cargo build              # debug build
+cargo build --release    # release build
+```
+
+[nextest]: https://nexte.st/
+[cargo-deny]: https://embarkstudios.github.io/cargo-deny/
+
+## Verification Checklist
+
+Run all four before sending a PR. CI runs the same gates.
+
+```sh
+cargo ci-fmt      # rustfmt --check
+cargo ci-lint     # clippy --all-targets -D warnings
+cargo ci-test     # nextest, --locked
+cargo deny check  # licenses, advisories, bans, sources
+```
+
+The `ci-*` aliases live in `.cargo/config.toml`. If `cargo ci-fmt` fails, run `cargo fmt` and re-stage.
+
+## Code Style
+
+rawb-io follows the [Rust API Guidelines][rust-api] and a few project-local rules:
+
+- **Idiomatic Rust.** Don't transliterate from C or Python; write Rust.
+- **Names matter.** Prefer meaningful names even if longer. Short names are fine in closures and tight loops.
+- **Small, focused functions.** Aim for code that makes sense when you come back to it in six months.
+- **Doc comments on every public item.** Private items get doc comments when behavior is non-obvious. Comments should explain *why*, not *what*.
+- **No premature abstraction.** Solve the problem in front of you.
+
+[rust-api]: https://rust-lang.github.io/api-guidelines/
+
+## The concurrency code is load-bearing
+
+`src/lib.rs` encodes fixes for a production deadlock and for IO-thread panics (see `CLAUDE.md` for the specifics). The error latch, the `PanicGuard`, the up-front error re-checks in `ThreadedWriter::write`, and the `park`/`unpark` blocking are invariants, not style choices. Changes on the IO path must preserve their exact behavior and keep the in-module tests green — those tests are the regression suite for the fixes. When in doubt, open an issue before refactoring.
+
+## `unsafe`
+
+The crate is `#![deny(unsafe_code)]` apart from a single narrow `#[allow(unsafe_code)]` on the read loop (the `MaybeUninit` → `&mut [u8]` cast and its `advance_write_index`). New `unsafe` is not accepted without a strong justification and a complete `SAFETY:` write-up; prefer a safe alternative.
+
+## Testing
+
+- **In-module unit tests** (`#[cfg(test)] mod tests`) cover round-trips, error surfacing, deadlock/panic regressions, and thread naming.
+- Generate test data in code; never commit data files.
+- Name tests after the behavior they assert; prefer many small tests over table-driven ones.
+- The re-entrant-write stress test honours a `REENTRANT_STRESS_ITERS=<n>` environment override — bump it (hundreds of thousands) when auditing a change to the write path locally.
+
+## Adding or upgrading dependencies
+
+rawb-io deliberately has a single runtime dependency (`ringbuf`) and no dev-dependencies. A new direct dependency needs a clear justification in the PR and a `cargo deny check` pass; new licenses get added to `deny.toml`'s allow-list only after deliberate review (no copyleft).
+
+## Pull Requests
+
+- Keep PRs focused. Commit messages explain *why*; the "what" is in the diff.
+- Each PR should include tests for the behavior it adds or changes.
+- Update `CHANGELOG.md`'s `[Unreleased]` section with a one-line entry in the appropriate subsection (Added / Changed / Fixed / Removed).
+- All four CI gates must be green before merge.
+
+## Releasing
+
+Releases are cut with [cargo-release]. Configuration lives in `release.toml`. Publishing is the maintainer's job.
+
+```sh
+cargo release 0.1.0            # dry run — review what would change
+cargo release 0.1.0 --execute  # bump, changelog, commit, tag, push, publish
+```
+
+After the push, create the GitHub release object pointing at the new tag (e.g. `gh release create v0.1.0 --notes-file ...`) using that version's CHANGELOG section as the notes.
+
+[cargo-release]: https://github.com/crate-ci/cargo-release
