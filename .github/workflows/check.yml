@@ -75,9 +75,9 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: >
           cargo +nightly miri test --
-          tests::threaded_reader_round_trip_small
-          tests::threaded_reader_round_trip_larger_than_ring
-          tests::threaded_writer_round_trip_with_finish
+          tests::read_ahead_round_trip_small
+          tests::read_ahead_round_trip_larger_than_ring
+          tests::write_behind_round_trip_with_finish
           tests::reader_error_latch_preserves_kind_and_is_idempotent
           tests::flush_propagates_to_the_sink
           tests::zero_length_reads_and_writes_do_not_block
@@ -94,7 +94,7 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-many-seeds=0..32"
         run: >
           cargo +nightly miri test --
-          tests::threaded_reader_round_trip_small
+          tests::read_ahead_round_trip_small
           tests::zero_length_reads_and_writes_do_not_block
           tests::eof_reads_stay_at_eof
 

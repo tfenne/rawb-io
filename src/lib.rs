@@ -1,4 +1,4 @@
-//! Read-ahead / write-behind byte IO: a [`ThreadedReader`] and [`ThreadedWriter`]
+//! Read-ahead / write-behind byte IO: a [`ReadAhead`] and [`WriteBehind`]
 //! that put a dedicated thread on one IO end, with a user-space byte ring buffer
 //! in between, so a pipeline stage never blocks on the kernel pipe.
 //!
@@ -14,14 +14,14 @@
 //! flushes a chunk to disk. Putting a dedicated IO thread and a larger buffer
 //! between a stage and each pipe decouples the compute from the IO.
 //!
-//! * [`ThreadedReader`] wraps a [`Read`] source. A background thread reads
+//! * [`ReadAhead`] wraps a [`Read`] source. A background thread reads
 //!   *ahead* into the ring, so the consumer's `read` / `fill_buf` is served from
 //!   user space instead of blocking on the kernel. Implements [`Read`] and
 //!   [`BufRead`].
-//! * [`ThreadedWriter`] wraps a [`Write`] sink. The caller's `write` returns as
+//! * [`WriteBehind`] wraps a [`Write`] sink. The caller's `write` returns as
 //!   soon as the bytes land in the ring, and a background thread flushes them
 //!   *behind* the caller. Implements [`Write`], plus an explicit
-//!   [`finish`](ThreadedWriter::finish).
+//!   [`finish`](WriteBehind::finish).
 //!
 //! The buffer between the two threads is a byte ring ([`ringbuf::HeapRb`]). That
 //! is an implementation detail — the crate is named for its *behavior*, not the
@@ -39,24 +39,24 @@
 //!
 //! ```
 //! use std::io::Read;
-//! use rawb_io::ThreadedReader;
+//! use rawb_io::ReadAhead;
 //!
-//! let mut reader = ThreadedReader::new(std::io::Cursor::new(b"hello, world".to_vec()), 1 << 20);
+//! let mut reader = ReadAhead::new(std::io::Cursor::new(b"hello, world".to_vec()), 1 << 20);
 //! let mut out = String::new();
 //! reader.read_to_string(&mut out).unwrap();
 //! assert_eq!(out, "hello, world");
 //! ```
 //!
 //! Write-behind: wrap any [`Write`]; `write` returns as soon as the bytes are
-//! buffered, and [`finish`](ThreadedWriter::finish) blocks until the background
+//! buffered, and [`finish`](WriteBehind::finish) blocks until the background
 //! thread has flushed everything, surfacing any error it hit and handing the
 //! sink back.
 //!
 //! ```
 //! use std::io::Write;
-//! use rawb_io::ThreadedWriter;
+//! use rawb_io::WriteBehind;
 //!
-//! let mut writer = ThreadedWriter::new(Vec::new(), 1 << 20);
+//! let mut writer = WriteBehind::new(Vec::new(), 1 << 20);
 //! writer.write_all(b"hello, world").unwrap();
 //! let sink = writer.finish().unwrap();
 //! assert_eq!(sink, b"hello, world");
@@ -87,7 +87,7 @@
 //!   cannot be cancelled — and any read-ahead still in the ring is
 //!   discarded. Dropping a writer drains the ring into the sink first, but
 //!   *silently discards* any error from that final drain; call
-//!   [`finish`](ThreadedWriter::finish) when the outcome matters.
+//!   [`finish`](WriteBehind::finish) when the outcome matters.
 //! * The first `Ok(0)` from the source is treated as end-of-stream: the IO
 //!   thread stops polling it, and the reader reports EOF from then on.
 //!   Sources that transiently return `Ok(0)` and later produce more data
@@ -128,15 +128,15 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 /// Default prefix for the spawned IO threads' names and their panic-fallback
-/// error message. [`ThreadedReader::new`] and [`ThreadedWriter::new`] use this;
-/// pass your own with [`ThreadedReader::with_thread_name`] /
-/// [`ThreadedWriter::with_thread_name`] to label the threads after your own
+/// error message. [`ReadAhead::new`] and [`WriteBehind::new`] use this;
+/// pass your own with [`ReadAhead::with_thread_name`] /
+/// [`WriteBehind::with_thread_name`] to label the threads after your own
 /// component.
 const DEFAULT_THREAD_PREFIX: &str = "rawb-io";
 
 // ─── State shared between an adapter and its IO thread ──────────────────────
 
-/// State shared between a [`ThreadedReader`] and its IO thread.
+/// State shared between a [`ReadAhead`] and its IO thread.
 struct ReaderShared {
     /// Set by the IO thread once the source reaches EOF — and on *every*
     /// failure path (error, panic), always strictly AFTER the error latch is
@@ -153,7 +153,7 @@ struct ReaderShared {
     waiter: Mutex<thread::Thread>,
 }
 
-/// State shared between a [`ThreadedWriter`] and its IO thread.
+/// State shared between a [`WriteBehind`] and its IO thread.
 struct WriterShared {
     /// Set by `finish()` or `Drop` to signal the IO thread that no more data
     /// is coming.
@@ -168,7 +168,7 @@ struct WriterShared {
     /// The IO thread's write error, if any. Written once by the IO thread and
     /// never drained, so its presence is the sticky "this writer has failed"
     /// state: every `write`/`flush`/`finish` copies it out (see
-    /// [`ThreadedWriter::peek_error`]) and rejects the operation, and a failed
+    /// [`WriteBehind::peek_error`]) and rejects the operation, and a failed
     /// writer can never accept more bytes into a ring its exited IO thread
     /// would never drain.
     error: Mutex<Option<io::Error>>,
@@ -225,7 +225,7 @@ fn unpark_waiter(waiter: &Mutex<thread::Thread>) {
 /// The first `Ok(0)` the source returns is treated as end-of-stream: the IO
 /// thread stops polling it and the reader reports EOF from then on, even if
 /// the source would later produce more bytes.
-pub struct ThreadedReader {
+pub struct ReadAhead {
     /// Consumer side of the ring buffer; the worker reads bytes from here.
     consumer: HeapCons<u8>,
     /// Handle to the IO read thread used to call `unpark` when the ring drains.
@@ -237,7 +237,7 @@ pub struct ThreadedReader {
     join: Option<JoinHandle<()>>,
 }
 
-impl ThreadedReader {
+impl ReadAhead {
     /// Spawn an IO thread that reads from `src` into a ring buffer of
     /// `ring_bytes` capacity (floored to 64 KiB).
     ///
@@ -297,7 +297,7 @@ impl ThreadedReader {
     }
 }
 
-impl Read for ThreadedReader {
+impl Read for ReadAhead {
     /// Copy up to `dst.len()` bytes out of the ring, blocking only while the
     /// ring is empty and the stream has not ended. An empty `dst` returns
     /// `Ok(0)` immediately *without consulting the stream state* — it does
@@ -318,7 +318,7 @@ impl Read for ThreadedReader {
     }
 }
 
-impl BufRead for ThreadedReader {
+impl BufRead for ReadAhead {
     /// Return the buffered bytes, blocking while the ring is empty until the
     /// IO thread delivers data, EOF, or an error. Bytes the source produced
     /// before failing are served before the error is reported.
@@ -379,7 +379,7 @@ impl BufRead for ThreadedReader {
 /// Stops the IO thread and joins it. If the source is blocked in `read`,
 /// this blocks until that read returns — a blocking read cannot be
 /// cancelled. Any read-ahead still in the ring is discarded.
-impl Drop for ThreadedReader {
+impl Drop for ReadAhead {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.io_thread.unpark();
@@ -387,9 +387,9 @@ impl Drop for ThreadedReader {
     }
 }
 
-impl fmt::Debug for ThreadedReader {
+impl fmt::Debug for ReadAhead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ThreadedReader")
+        f.debug_struct("ReadAhead")
             .field("io_thread", &self.io_thread.name())
             .field("buffered", &self.consumer.occupied_len())
             .field("eof", &self.shared.eof.load(Ordering::Relaxed))
@@ -416,7 +416,7 @@ impl fmt::Debug for ThreadedReader {
 /// the ring into the sink, but silently discards any error.
 ///
 /// [`File`]: std::fs::File
-pub struct ThreadedWriter<W> {
+pub struct WriteBehind<W> {
     /// Producer side of the ring buffer; the worker pushes bytes here.
     producer: HeapProd<u8>,
     /// Handle to the IO write thread used to call `unpark` when new bytes are
@@ -430,7 +430,7 @@ pub struct ThreadedWriter<W> {
     join: Option<JoinHandle<Option<W>>>,
 }
 
-impl<W: Write + Send + 'static> ThreadedWriter<W> {
+impl<W: Write + Send + 'static> WriteBehind<W> {
     /// Spawn an IO thread that writes the ring contents to `dst`. Ring
     /// holds `ring_bytes` of pending output (floored to 64 KiB).
     ///
@@ -481,7 +481,7 @@ impl<W: Write + Send + 'static> ThreadedWriter<W> {
     }
 }
 
-impl<W> ThreadedWriter<W> {
+impl<W> WriteBehind<W> {
     /// Flush remaining bytes, signal the IO thread to drain, join it, and
     /// hand back the sink.
     ///
@@ -511,7 +511,7 @@ impl<W> ThreadedWriter<W> {
     }
 }
 
-impl<W> Write for ThreadedWriter<W> {
+impl<W> Write for WriteBehind<W> {
     /// Push `buf` into the ring, blocking only while the ring is full; the
     /// bytes reach the sink asynchronously. A previous IO failure is
     /// reported up front — including for zero-length writes — and a failure
@@ -597,8 +597,8 @@ impl<W> Write for ThreadedWriter<W> {
 /// Signals end-of-stream, drains the ring into the sink, and joins the IO
 /// thread — so dropping can block while the sink accepts the remaining
 /// bytes. Any error from that final drain is *silently discarded*; call
-/// [`finish`](ThreadedWriter::finish) when the outcome matters.
-impl<W> Drop for ThreadedWriter<W> {
+/// [`finish`](WriteBehind::finish) when the outcome matters.
+impl<W> Drop for WriteBehind<W> {
     fn drop(&mut self) {
         // If finish() wasn't called, signal anyway so the IO thread can
         // shut down cleanly. Errors are silently dropped here — explicit
@@ -609,9 +609,9 @@ impl<W> Drop for ThreadedWriter<W> {
     }
 }
 
-impl<W> fmt::Debug for ThreadedWriter<W> {
+impl<W> fmt::Debug for WriteBehind<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ThreadedWriter")
+        f.debug_struct("WriteBehind")
             .field("io_thread", &self.io_thread.name())
             .field("pending", &self.producer.occupied_len())
             .field("finished", &self.shared.finished.load(Ordering::Relaxed))
@@ -625,7 +625,7 @@ impl<W> fmt::Debug for ThreadedWriter<W> {
 /// Convert an IO-thread panic payload into the error latched for the user.
 ///
 /// `panic_message` carries the thread-name prefix (see
-/// [`ThreadedReader::with_thread_name`]) so the surfaced failure names the
+/// [`ReadAhead::with_thread_name`]) so the surfaced failure names the
 /// component whose IO thread died; the payload's text (the argument of the
 /// `panic!`) is appended when it is a string, so the actual failure message
 /// reaches the caller instead of being discarded with the join result.
@@ -994,18 +994,18 @@ mod readme_doctests {}
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
-/// assert_send::<rawb_io::ThreadedReader>();
-/// assert_send::<rawb_io::ThreadedWriter<Vec<u8>>>();
+/// assert_send::<rawb_io::ReadAhead>();
+/// assert_send::<rawb_io::WriteBehind<Vec<u8>>>();
 /// ```
 ///
 /// ```compile_fail
 /// fn assert_sync<T: Sync>() {}
-/// assert_sync::<rawb_io::ThreadedReader>();
+/// assert_sync::<rawb_io::ReadAhead>();
 /// ```
 ///
 /// ```compile_fail
 /// fn assert_sync<T: Sync>() {}
-/// assert_sync::<rawb_io::ThreadedWriter<Vec<u8>>>();
+/// assert_sync::<rawb_io::WriteBehind<Vec<u8>>>();
 /// ```
 #[cfg(doctest)]
 mod send_sync_pins {}
@@ -1015,11 +1015,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Round-trip a payload through a ThreadedReader: bytes in == bytes out.
+    /// Round-trip a payload through a ReadAhead: bytes in == bytes out.
     #[test]
-    fn threaded_reader_round_trip_small() {
+    fn read_ahead_round_trip_small() {
         let payload: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), 64 * 1024);
         let mut out = Vec::new();
         std::io::copy(&mut r, &mut out).unwrap();
         assert_eq!(out, payload);
@@ -1027,23 +1027,23 @@ mod tests {
 
     /// Payload much larger than the ring buffer — exercises the wrap-around.
     #[test]
-    fn threaded_reader_round_trip_larger_than_ring() {
+    fn read_ahead_round_trip_larger_than_ring() {
         // The constructor floors the ring to 64 KiB, so the payload must
         // exceed THAT to actually wrap. (With a smaller nominal ring this
         // test silently stopped testing wrap-around once — review caught it.)
         let ring = 64 * 1024;
         let payload: Vec<u8> = (0..(ring * 8) as u32).map(|i| i as u8).collect();
-        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), ring);
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), ring);
         let mut out = Vec::new();
         std::io::copy(&mut r, &mut out).unwrap();
         assert_eq!(out, payload);
     }
 
-    /// Write a payload through ThreadedWriter and confirm the underlying
+    /// Write a payload through WriteBehind and confirm the underlying
     /// sink received every byte after `finish()`.
     #[test]
-    fn threaded_writer_round_trip_with_finish() {
-        // ThreadedWriter takes ownership of `W: Write + Send + 'static`, so
+    fn write_behind_round_trip_with_finish() {
+        // WriteBehind takes ownership of `W: Write + Send + 'static`, so
         // we hand it a `Sink` that mirrors bytes into a shared buffer the
         // test can inspect.
         struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1059,7 +1059,7 @@ mod tests {
 
         let payload: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let mut w = ThreadedWriter::new(Sink(captured.clone()), 4096);
+        let mut w = WriteBehind::new(Sink(captured.clone()), 4096);
         w.write_all(&payload).unwrap();
         w.finish().unwrap();
         assert_eq!(*captured.lock().unwrap(), payload);
@@ -1080,7 +1080,7 @@ mod tests {
     /// producer forever against a full, never-draining ring. Regression test
     /// for the missing error re-check after `park()` in `write`.
     #[test]
-    fn threaded_writer_surfaces_sink_error_without_deadlock() {
+    fn write_behind_surfaces_sink_error_without_deadlock() {
         // Payload ≫ ring (clamped to a 64 KiB minimum) forces the producer
         // to fill the ring and park while the IO thread dies on its first
         // write.
@@ -1088,7 +1088,7 @@ mod tests {
         let payload = vec![0u8; 1024 * 1024];
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            let mut w = ThreadedWriter::new(FailingSink, ring);
+            let mut w = WriteBehind::new(FailingSink, ring);
             let result = w.write_all(&payload).and_then(|()| w.finish());
             tx.send(result.is_err()).unwrap();
         });
@@ -1103,10 +1103,10 @@ mod tests {
     /// failure rather than falsely returning `Ok`. The error slot is a latch
     /// that is never drained, so both calls observe it.
     #[test]
-    fn threaded_writer_finish_fails_after_error_already_surfaced() {
+    fn write_behind_finish_fails_after_error_already_surfaced() {
         let ring = 4096;
         let payload = vec![7u8; 1024 * 1024];
-        let mut w = ThreadedWriter::new(FailingSink, ring);
+        let mut w = WriteBehind::new(FailingSink, ring);
         // The oversized payload guarantees the producer parks and observes
         // the error, so the first `write_all` returns `Err`.
         assert!(w.write_all(&payload).is_err());
@@ -1134,7 +1134,7 @@ mod tests {
     /// Returns `Some(value)` if `body` completes, or `None` if it *deadlocks*
     /// (parks forever). A non-deadlocked body finishes in microseconds, so the
     /// 10 s bound only ever elapses on a genuine hang. On deadlock we repeatedly
-    /// `unpark` the stuck thread — each nudge lets `ThreadedWriter::write` fall
+    /// `unpark` the stuck thread — each nudge lets `WriteBehind::write` fall
     /// through to its post-park error re-check and return, and a body that
     /// re-parks (a loop of writes, like a block-buffering writer's multi-write
     /// `Drop`) needs several — then join it, so the stress test never leaks
@@ -1176,14 +1176,14 @@ mod tests {
         None
     }
 
-    /// Drive a `ThreadedWriter` over a failing sink to the exact deadlock state:
+    /// Drive a `WriteBehind` over a failing sink to the exact deadlock state:
     /// surface the write error, leaving the ring full and the IO thread gone,
     /// then re-enter `write` repeatedly the way a block-buffering writer's `Drop`
     /// does. Returns `true` iff every write surfaced an error. Without the fix one of
     /// the re-entrant writes parks forever, so this never returns and the
     /// watchdog reports a deadlock instead.
     fn reentrant_write_after_error_surfaced(ring: usize) -> bool {
-        let mut w = ThreadedWriter::new(FailingSink, ring);
+        let mut w = WriteBehind::new(FailingSink, ring);
         // Payload ≥ ring: the producer fills the ring and parks while the IO
         // thread dies on its first write, so this surfaces the error and leaves
         // the ring full with the IO thread already exited.
@@ -1205,7 +1205,7 @@ mod tests {
     /// released binary hung for hours when its downstream sink died on a full
     /// disk (ENOSPC).
     #[test]
-    fn threaded_writer_reentrant_write_after_error_does_not_deadlock() {
+    fn write_behind_reentrant_write_after_error_does_not_deadlock() {
         let all_errored =
             run_or_detect_deadlock(|| reentrant_write_after_error_surfaced(64 * 1024)).expect(
                 "re-entrant write deadlocked: parked on a full ring whose IO thread had exited",
@@ -1235,7 +1235,7 @@ mod tests {
     /// on it harder (e.g. hundreds of thousands) when auditing the fix locally,
     /// or run the soak variant.
     #[test]
-    fn threaded_writer_reentrant_write_stress_no_deadlock() {
+    fn write_behind_reentrant_write_stress_no_deadlock() {
         let iters = std::env::var("REENTRANT_STRESS_ITERS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1246,7 +1246,7 @@ mod tests {
     /// A panic inside the IO write thread must not deadlock the producer and
     /// must surface as a failure (not a silently-successful `finish`).
     #[test]
-    fn threaded_writer_panic_surfaces_without_deadlock() {
+    fn write_behind_panic_surfaces_without_deadlock() {
         struct PanicSink;
         impl Write for PanicSink {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
@@ -1260,7 +1260,7 @@ mod tests {
         let payload = vec![1u8; 1024 * 1024];
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            let mut w = ThreadedWriter::new(PanicSink, ring);
+            let mut w = WriteBehind::new(PanicSink, ring);
             let result = w.write_all(&payload).and_then(|()| w.finish());
             tx.send(result.is_err()).unwrap();
         });
@@ -1298,7 +1298,7 @@ mod tests {
             payload: Cursor::new(payload.clone()),
             thread_name: thread_name.clone(),
         };
-        let mut r = ThreadedReader::with_thread_name(src, 64 * 1024, "my-stage");
+        let mut r = ReadAhead::with_thread_name(src, 64 * 1024, "my-stage");
         let mut out = Vec::new();
         std::io::copy(&mut r, &mut out).unwrap();
         assert_eq!(out, payload, "read must round-trip identically to new()");
@@ -1332,9 +1332,9 @@ mod tests {
     /// for the captured-`Thread`-handle deadlock, which parked the consuming
     /// thread forever the moment it saw an empty ring.
     #[test]
-    fn threaded_reader_moved_across_threads_does_not_deadlock() {
+    fn read_ahead_moved_across_threads_does_not_deadlock() {
         let payload = vec![7u8; 1024];
-        let reader = ThreadedReader::new(
+        let reader = ReadAhead::new(
             SlowStartSource {
                 payload: Some(payload.clone()),
                 delay: std::time::Duration::from_millis(100),
@@ -1372,10 +1372,10 @@ mod tests {
     /// deadlock once the ring fills. Regression test for the write side of
     /// the captured-`Thread`-handle deadlock.
     #[test]
-    fn threaded_writer_moved_across_threads_does_not_deadlock() {
+    fn write_behind_moved_across_threads_does_not_deadlock() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let payload = vec![42u8; 256 * 1024]; // 4x the (floored) 64 KiB ring
-        let writer = ThreadedWriter::new(
+        let writer = WriteBehind::new(
             SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(5) },
             64 * 1024,
         );
@@ -1392,7 +1392,7 @@ mod tests {
     /// A panic in the IO read thread must surface as an error rather than
     /// hanging the consumer (or masquerading as a clean EOF).
     #[test]
-    fn threaded_reader_panic_surfaces_without_deadlock() {
+    fn read_ahead_panic_surfaces_without_deadlock() {
         struct PanicSource;
         impl Read for PanicSource {
             fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
@@ -1400,7 +1400,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::new(PanicSource, 64 * 1024);
+            let mut r = ReadAhead::new(PanicSource, 64 * 1024);
             let mut out = Vec::new();
             r.read_to_end(&mut out)
         })
@@ -1452,8 +1452,7 @@ mod tests {
     {
         for i in 0..iters {
             let spins = (i % 3000) as u32;
-            let mut r =
-                ThreadedReader::with_thread_name(make_source(spins), 64 * 1024, "mask-probe");
+            let mut r = ReadAhead::with_thread_name(make_source(spins), 64 * 1024, "mask-probe");
             // Pass 1: take the byte. A clean EOF is impossible here (the byte
             // sits in the ring until consumed), so the only outcomes are data
             // or an already-latched error.
@@ -1561,7 +1560,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::new(LyingSource, 64 * 1024);
+            let mut r = ReadAhead::new(LyingSource, 64 * 1024);
             let mut out = Vec::new();
             r.read_to_end(&mut out).map(|_| out.len())
         })
@@ -1574,7 +1573,7 @@ mod tests {
     /// this livelocked: std's `read_to_string` retries `Interrupted` by
     /// contract, and the latch re-served it forever — losing "hello" too.
     #[test]
-    fn threaded_reader_retries_interrupted_source() {
+    fn read_ahead_retries_interrupted_source() {
         struct InterruptedOnceSource {
             state: u8,
         }
@@ -1595,7 +1594,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::new(InterruptedOnceSource { state: 0 }, 64 * 1024);
+            let mut r = ReadAhead::new(InterruptedOnceSource { state: 0 }, 64 * 1024);
             let mut out = String::new();
             r.read_to_string(&mut out).map(|_| out)
         })
@@ -1607,7 +1606,7 @@ mod tests {
     /// retried, not latched (`write_all` already retries EINTR internally; the
     /// final flush needs the same treatment).
     #[test]
-    fn threaded_writer_retries_interrupted_flush() {
+    fn write_behind_retries_interrupted_flush() {
         struct FlushInterruptedSink {
             received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
             interrupted_once: bool,
@@ -1626,7 +1625,7 @@ mod tests {
             }
         }
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut w = ThreadedWriter::new(
+        let mut w = WriteBehind::new(
             FlushInterruptedSink { received: received.clone(), interrupted_once: false },
             64 * 1024,
         );
@@ -1645,7 +1644,7 @@ mod tests {
         // Ring larger than the payload so write_all itself never blocks; the
         // slow sink guarantees the bytes are still in flight when flush is
         // called.
-        let mut w = ThreadedWriter::new(
+        let mut w = WriteBehind::new(
             SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(50) },
             1 << 20,
         );
@@ -1680,7 +1679,7 @@ mod tests {
     #[test]
     fn flush_propagates_to_the_sink() {
         let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut w = ThreadedWriter::new(FlushCountingSink { flushes: flushes.clone() }, 64 * 1024);
+        let mut w = WriteBehind::new(FlushCountingSink { flushes: flushes.clone() }, 64 * 1024);
         w.write_all(b"abc").unwrap();
         w.flush().unwrap();
         let after_first = flushes.load(std::sync::atomic::Ordering::Relaxed);
@@ -1716,8 +1715,7 @@ mod tests {
             }
         }
         let payload: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
-        let mut r =
-            ThreadedReader::new(GoodThenErrorSource { payload: Some(payload.clone()) }, 1 << 20);
+        let mut r = ReadAhead::new(GoodThenErrorSource { payload: Some(payload.clone()) }, 1 << 20);
         let mut out = Vec::new();
         let result = r.read_to_end(&mut out);
         assert!(result.is_err(), "the source's failure must surface");
@@ -1735,7 +1733,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::TimedOut, "sensor went away"))
             }
         }
-        let mut r = ThreadedReader::new(FailingSource, 64 * 1024);
+        let mut r = ReadAhead::new(FailingSource, 64 * 1024);
         let mut buf = [0u8; 16];
         for attempt in 0..3 {
             let err = r.read(&mut buf).expect_err("a failing source must error");
@@ -1750,7 +1748,7 @@ mod tests {
     #[test]
     fn flush_after_io_thread_death_errors_without_deadlock() {
         let result = run_or_detect_deadlock(|| {
-            let mut w = ThreadedWriter::new(FailingSink, 4096);
+            let mut w = WriteBehind::new(FailingSink, 4096);
             // Oversized payload guarantees the IO thread dies and the error
             // is surfaced by write_all.
             let _ = w.write_all(&vec![0u8; 2 * 64 * 1024]);
@@ -1766,7 +1764,7 @@ mod tests {
     /// surfaces on the caller's next operation.
     #[test]
     fn write_reports_partial_consumption_before_surfacing_error() {
-        let mut w = ThreadedWriter::new(FailingSink, 4096); // ring floors to 64 KiB
+        let mut w = WriteBehind::new(FailingSink, 4096); // ring floors to 64 KiB
         let payload = vec![0u8; 128 * 1024]; // 2x the ring
         let n = w.write(&payload).expect("a write that consumed bytes must return Ok(n)");
         assert!(n > 0 && n < payload.len(), "the ring-full write consumed only part: {n}");
@@ -1787,13 +1785,13 @@ mod tests {
             }
         }
         let n = run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::new(NeverReadySource, 64 * 1024);
+            let mut r = ReadAhead::new(NeverReadySource, 64 * 1024);
             r.read(&mut []).unwrap()
         })
         .expect("read with an empty destination blocked waiting for data");
         assert_eq!(n, 0);
 
-        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        let mut w = WriteBehind::new(Vec::new(), 64 * 1024);
         assert_eq!(w.write(&[]).unwrap(), 0);
         w.finish().unwrap();
     }
@@ -1810,7 +1808,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::with_thread_name(PanicSource, 64 * 1024, "payload-probe");
+            let mut r = ReadAhead::with_thread_name(PanicSource, 64 * 1024, "payload-probe");
             let mut out = Vec::new();
             r.read_to_end(&mut out)
         })
@@ -1834,7 +1832,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut w = ThreadedWriter::new(PanicSink, 4096);
+            let mut w = WriteBehind::new(PanicSink, 4096);
             w.write_all(&vec![1u8; 128 * 1024]).and_then(|()| w.finish().map(drop))
         })
         .expect("writer deadlocked on a panicking IO thread");
@@ -1848,7 +1846,7 @@ mod tests {
     #[test]
     fn finish_returns_the_sink_with_all_bytes() {
         let payload: Vec<u8> = (0..100_000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        let mut w = WriteBehind::new(Vec::new(), 64 * 1024);
         w.write_all(&payload).unwrap();
         let sink = w.finish().expect("finish must succeed");
         assert_eq!(sink, payload);
@@ -1871,7 +1869,7 @@ mod tests {
             }
         }
         run_or_detect_deadlock(|| {
-            let mut r = ThreadedReader::new(EndlessSource, 64 * 1024);
+            let mut r = ReadAhead::new(EndlessSource, 64 * 1024);
             let mut buf = [0u8; 1024];
             r.read_exact(&mut buf).unwrap();
             // Give the IO thread time to refill the ring and park on it.
@@ -1888,7 +1886,7 @@ mod tests {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let payload = vec![3u8; 100_000];
         {
-            let mut w = ThreadedWriter::new(
+            let mut w = WriteBehind::new(
                 SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(1) },
                 1 << 20, // ring holds the whole payload: the drop must drain it
             );
@@ -1904,7 +1902,7 @@ mod tests {
     fn slow_sink_backpressure_round_trip() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 31) as u8).collect();
-        let mut w = ThreadedWriter::new(
+        let mut w = WriteBehind::new(
             SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(2) },
             64 * 1024,
         );
@@ -1935,8 +1933,7 @@ mod tests {
         }
         let payload: Vec<u8> =
             (0..64 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
-        let mut r =
-            ThreadedReader::new(TricklingSource { payload: payload.clone(), pos: 0 }, 64 * 1024);
+        let mut r = ReadAhead::new(TricklingSource { payload: payload.clone(), pos: 0 }, 64 * 1024);
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
@@ -1946,7 +1943,7 @@ mod tests {
     /// fill_bufs keep reporting end-of-stream.
     #[test]
     fn eof_reads_stay_at_eof() {
-        let mut r = ThreadedReader::new(Cursor::new(b"tail".to_vec()), 64 * 1024);
+        let mut r = ReadAhead::new(Cursor::new(b"tail".to_vec()), 64 * 1024);
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"tail");
@@ -1960,8 +1957,8 @@ mod tests {
     #[test]
     fn chained_reader_writer_round_trip() {
         let payload: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
-        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), 64 * 1024);
+        let mut w = WriteBehind::new(Vec::new(), 64 * 1024);
         std::io::copy(&mut r, &mut w).unwrap();
         let sink = w.finish().unwrap();
         assert_eq!(sink, payload);
@@ -1987,7 +1984,7 @@ mod tests {
             }
         }
         let thread_name = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let mut w = ThreadedWriter::with_thread_name(
+        let mut w = WriteBehind::with_thread_name(
             NameCapturingSink { thread_name: thread_name.clone() },
             64 * 1024,
             "my-stage",
@@ -2034,12 +2031,12 @@ mod tests {
     #[test]
     fn tiny_ring_bytes_floors_and_round_trips() {
         let payload: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
-        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 0);
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), 0);
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
 
-        let mut w = ThreadedWriter::new(Vec::new(), 1);
+        let mut w = WriteBehind::new(Vec::new(), 1);
         w.write_all(&payload).unwrap();
         assert_eq!(w.finish().unwrap(), payload);
     }
@@ -2082,7 +2079,7 @@ mod tests {
             .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 9) as u8)
             .collect();
 
-        let mut r = ThreadedReader::new(
+        let mut r = ReadAhead::new(
             RandomChunkSource {
                 payload: payload.clone(),
                 pos: 0,
@@ -2103,7 +2100,7 @@ mod tests {
         }
         assert_eq!(out, payload, "reader corrupted the stream across ring wraps (seed {seed})");
 
-        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        let mut w = WriteBehind::new(Vec::new(), 64 * 1024);
         let mut rng = XorShift((seed ^ 0xB529_7A4D) | 1);
         let mut written = 0;
         while written < payload.len() {
@@ -2165,7 +2162,7 @@ mod tests {
         }
         // 96 000 bytes through the 64 KiB minimum ring = 1.5 laps, so the
         // source inspects both freshly-zeroed and recycled storage.
-        let mut r = ThreadedReader::new(NosySource { remaining: 96_000 }, 64 * 1024);
+        let mut r = ReadAhead::new(NosySource { remaining: 96_000 }, 64 * 1024);
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out.len(), 96_000);
@@ -2174,13 +2171,13 @@ mod tests {
     // ─── Cross-thread usage patterns ─────────────────────────────────────────
 
     /// The realistic shared-writer shape: several threads take turns writing
-    /// through a `Mutex<ThreadedWriter>`. Every parked write must be woken no
+    /// through a `Mutex<WriteBehind>`. Every parked write must be woken no
     /// matter which thread parked (repeated waiter re-registration), and each
     /// chunk written under the lock must arrive contiguously.
     #[test]
     fn writer_shared_behind_a_mutex_across_threads_round_trips() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = std::sync::Arc::new(std::sync::Mutex::new(ThreadedWriter::new(
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(WriteBehind::new(
             SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(1) },
             64 * 1024,
         )));
@@ -2221,7 +2218,7 @@ mod tests {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_buffer = received.clone();
         run_or_detect_deadlock(move || {
-            let mut writer = ThreadedWriter::new(
+            let mut writer = WriteBehind::new(
                 SlowSink { received: sink_buffer, delay: std::time::Duration::from_millis(1) },
                 64 * 1024,
             );
@@ -2263,8 +2260,8 @@ mod tests {
     #[test]
     fn nested_threaded_writers_propagate_inner_sink_errors() {
         let result = run_or_detect_deadlock(|| {
-            let inner = ThreadedWriter::new(FailingSink, 64 * 1024);
-            let mut outer = ThreadedWriter::new(inner, 64 * 1024);
+            let inner = WriteBehind::new(FailingSink, 64 * 1024);
+            let mut outer = WriteBehind::new(inner, 64 * 1024);
             outer.write_all(&vec![5u8; 8 * 1024]).and_then(|()| outer.finish().map(drop))
         })
         .expect("nested writers deadlocked");
@@ -2299,7 +2296,7 @@ mod tests {
     fn flush_integrity_sweep(failure_points: impl Iterator<Item = usize>) {
         for limit in failure_points {
             let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut w = ThreadedWriter::new(
+            let mut w = WriteBehind::new(
                 ByteLimitedSink { received: received.clone(), remaining: limit },
                 64 * 1024,
             );
@@ -2334,10 +2331,10 @@ mod tests {
     /// slot) and identify the adapter.
     #[test]
     fn debug_impls_render() {
-        let r = ThreadedReader::new(Cursor::new(vec![1u8; 16]), 64 * 1024);
-        assert!(format!("{r:?}").contains("ThreadedReader"));
-        let w = ThreadedWriter::new(Vec::new(), 64 * 1024);
-        assert!(format!("{w:?}").contains("ThreadedWriter"));
+        let r = ReadAhead::new(Cursor::new(vec![1u8; 16]), 64 * 1024);
+        assert!(format!("{r:?}").contains("ReadAhead"));
+        let w = WriteBehind::new(Vec::new(), 64 * 1024);
+        assert!(format!("{w:?}").contains("WriteBehind"));
     }
 
     // ─── Pins from the independent review round ──────────────────────────────
@@ -2363,7 +2360,7 @@ mod tests {
                 }
             }
         }
-        let mut r = ThreadedReader::new(ZeroThenData { calls: 0 }, 64 * 1024);
+        let mut r = ReadAhead::new(ZeroThenData { calls: 0 }, 64 * 1024);
         let mut buf = [0u8; 8];
         assert_eq!(r.read(&mut buf).unwrap(), 0);
         assert_eq!(r.read(&mut buf).unwrap(), 0, "the first Ok(0) must be terminal");
@@ -2381,11 +2378,11 @@ mod tests {
                 Err(io::Error::other("source dead"))
             }
         }
-        let mut r = ThreadedReader::new(AlwaysFailingSource, 64 * 1024);
+        let mut r = ReadAhead::new(AlwaysFailingSource, 64 * 1024);
         assert!(r.read(&mut [0u8; 8]).is_err(), "the failure must latch first");
         assert_eq!(r.read(&mut []).unwrap(), 0, "empty reads do not consult stream state");
 
-        let mut w = ThreadedWriter::new(FailingSink, 4096);
+        let mut w = WriteBehind::new(FailingSink, 4096);
         let _ = w.write_all(&vec![0u8; 128 * 1024]); // provoke + surface the latch
         assert!(w.write(&[]).is_err(), "empty writes report the latched error eagerly");
     }
@@ -2404,7 +2401,7 @@ mod tests {
             }
         }
         let result = run_or_detect_deadlock(|| {
-            let mut w = ThreadedWriter::new(ZeroSink, 4096);
+            let mut w = WriteBehind::new(ZeroSink, 4096);
             w.write_all(b"data").and_then(|()| w.finish().map(drop))
         })
         .expect("writer deadlocked on a zero-accepting sink");
@@ -2416,7 +2413,7 @@ mod tests {
     /// corrupting the ring (matching `BufReader`, which clamps too).
     #[test]
     fn consume_beyond_fill_buf_saturates() {
-        let mut r = ThreadedReader::new(Cursor::new(b"hello".to_vec()), 64 * 1024);
+        let mut r = ReadAhead::new(Cursor::new(b"hello".to_vec()), 64 * 1024);
         let buffered = r.fill_buf().unwrap().len();
         assert!(buffered > 0);
         r.consume(buffered + 1000); // over-consume: must clamp, not corrupt
@@ -2431,7 +2428,7 @@ mod tests {
     fn writer_drop_without_finish_flushes_the_sink_itself() {
         let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
-            let mut w = ThreadedWriter::new(FlushCountingSink { flushes: flushes.clone() }, 4096);
+            let mut w = WriteBehind::new(FlushCountingSink { flushes: flushes.clone() }, 4096);
             w.write_all(b"pending").unwrap();
         } // dropped without finish()
         assert!(
@@ -2440,13 +2437,13 @@ mod tests {
         );
     }
 
-    /// Several threads take turns reading through a `Mutex<ThreadedReader>` —
+    /// Several threads take turns reading through a `Mutex<ReadAhead>` —
     /// the read-side analog of the pooled-writer test (repeated waiter
     /// re-registration on the consumer side).
     #[test]
     fn reader_shared_behind_a_mutex_across_threads_round_trips() {
         let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 13) as u8).collect();
-        let reader = std::sync::Arc::new(std::sync::Mutex::new(ThreadedReader::new(
+        let reader = std::sync::Arc::new(std::sync::Mutex::new(ReadAhead::new(
             Cursor::new(payload.clone()),
             64 * 1024,
         )));
@@ -2483,7 +2480,7 @@ mod tests {
     #[test]
     fn slow_consumer_reader_backpressure_round_trip() {
         let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 7) as u8).collect();
-        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), 64 * 1024);
         let mut out = Vec::new();
         let mut buf = vec![0u8; 8 * 1024];
         let mut chunks = 0;
@@ -2508,8 +2505,8 @@ mod tests {
     #[test]
     fn construct_then_immediate_drop_is_clean() {
         for _ in 0..100 {
-            drop(ThreadedReader::new(Cursor::new(vec![0u8; 8]), 64 * 1024));
-            drop(ThreadedWriter::new(Vec::new(), 64 * 1024));
+            drop(ReadAhead::new(Cursor::new(vec![0u8; 8]), 64 * 1024));
+            drop(WriteBehind::new(Vec::new(), 64 * 1024));
         }
     }
 
@@ -2574,7 +2571,7 @@ mod tests {
     fn soak_cross_thread_construct_use_cycles() {
         let payload = vec![0xa5u8; 4096];
         for _ in 0..8_000 {
-            let reader = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
+            let reader = ReadAhead::new(Cursor::new(payload.clone()), 64 * 1024);
             let out = thread::spawn(move || {
                 let mut r = reader;
                 let mut out = Vec::new();
@@ -2585,7 +2582,7 @@ mod tests {
             .unwrap();
             assert_eq!(out, payload);
 
-            let writer = ThreadedWriter::new(Vec::new(), 64 * 1024);
+            let writer = WriteBehind::new(Vec::new(), 64 * 1024);
             let expected = payload.clone();
             let sink = thread::spawn(move || {
                 let mut w = writer;

@@ -47,7 +47,7 @@ rawb-io follows the [Rust API Guidelines][rust-api] and a few project-local rule
 
 ## The concurrency code is load-bearing
 
-`src/lib.rs` encodes fixes for production deadlocks, shutdown races, and IO-thread panics (see `CLAUDE.md` for the full inventory). In particular: the write-once error latch; the waiter-slot wake protocol (register → re-check → park on the user side; change state → read slot → unpark on the IO side); the error-before-EOF publication order and `fill_buf`'s latch re-check after observing EOF; the `catch_unwind` panic boundary around each IO loop; the flush epoch handshake; and the up-front + post-park error re-checks in `ThreadedWriter::write`. These are invariants, not style choices. Changes on the IO path must preserve their exact behavior and keep the in-module tests green — those tests are the regression suite for the fixes. When in doubt, open an issue before refactoring.
+`src/lib.rs` encodes fixes for production deadlocks, shutdown races, and IO-thread panics (see `CLAUDE.md` for the full inventory). In particular: the write-once error latch; the waiter-slot wake protocol (register → re-check → park on the user side; change state → read slot → unpark on the IO side); the error-before-EOF publication order and `fill_buf`'s latch re-check after observing EOF; the `catch_unwind` panic boundary around each IO loop; the flush epoch handshake; and the up-front + post-park error re-checks in `WriteBehind::write`. These are invariants, not style choices. Changes on the IO path must preserve their exact behavior and keep the in-module tests green — those tests are the regression suite for the fixes. When in doubt, open an issue before refactoring.
 
 ## `unsafe`
 
