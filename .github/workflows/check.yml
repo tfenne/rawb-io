@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: "1.89.0"
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Install nextest
         uses: taiki-e/install-action@e4b21e1a4de672bc0de96fc2afab9d8081b1d622 # nextest
       - name: Unit tests
@@ -134,7 +134,7 @@ jobs:
         with:
           components: clippy
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Clippy check
         run: cargo ci-lint
       # Build the publishable tarball (and compile from it) so packaging
@@ -152,6 +152,6 @@ jobs:
         with:
           components: rustfmt
       - name: Set up compilation cache (sccache)
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Rustfmt check
         run: cargo ci-fmt
