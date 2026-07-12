@@ -40,7 +40,7 @@ reader.read_to_end(&mut buf)?;
 
 ### Write-behind
 
-`ThreadedWriter` implements `Write`. Call `finish()` when you are done: it flushes any buffered bytes, signals the IO thread to drain, joins it, and returns the IO thread's final result — this is where a downstream write error surfaces, so prefer it over relying on `Drop`.
+`ThreadedWriter` implements `Write`. Call `finish()` when you are done: it flushes any buffered bytes, signals the IO thread to drain, joins it, and hands the sink back — this is where a downstream write error surfaces, so prefer it over relying on `Drop`. Getting the sink back means you can, for example, fsync a `File` before renaming it into place.
 
 ```rust
 use std::io::Write;
@@ -72,7 +72,7 @@ let reader = ThreadedReader::with_thread_name(source, 1 << 20, "decoder");
 
 ## Error handling
 
-Both adapters surface an IO-thread failure through the normal `io::Result` return values. The failure is *latched*: once the IO thread reports an error (or panics), every subsequent `read` / `write` / `flush` / `finish` returns that error rather than masking it as a clean EOF or a silent success. On the write side this is also what prevents a deadlock — a failed writer rejects further writes up front instead of pushing into a ring buffer its already-exited IO thread can never drain. (`io::Error` is `!Clone`, so the latched error is surfaced by reconstruction: OS errors round-trip losslessly by errno; others preserve the kind and message.)
+Both adapters surface an IO-thread failure through the normal `io::Result` return values. The failure is *latched*: once the IO thread reports an error (or panics), every subsequent `read` / `write` / `flush` / `finish` returns that error rather than masking it as a clean EOF or a silent success. On the read side the error surfaces only after every successfully-read byte has been delivered, so the consumer sees the same prefix a plain `BufReader` would have produced, then the failure. Transient `ErrorKind::Interrupted` (EINTR) results from the source or sink are the exception: the IO threads retry them, matching std's conventions, instead of latching them as permanent failures. On the write side this is also what prevents a deadlock — a failed writer rejects further writes up front instead of pushing into a ring buffer its already-exited IO thread can never drain. (`io::Error` is `!Clone`, so the latched error is surfaced by reconstruction: OS errors round-trip losslessly by errno; others preserve the kind and message.)
 
 ## Implementation notes
 
@@ -84,7 +84,7 @@ The minimum supported Rust version is **1.89**.
 
 ### `unsafe`
 
-The crate sets `#![deny(unsafe_code)]`. Its only `unsafe` is two adjacent sites in the read loop: a `MaybeUninit<u8>` → `&mut [u8]` cast that lets `Read::read` write straight into the ring buffer (avoiding a second copy through a temporary), and the matching `advance_write_index` that publishes exactly the bytes just read. Both are documented in full at the call site and will be removed once [`std::io::BorrowedBuf`](https://github.com/rust-lang/rust/issues/117693) stabilizes, which expresses "borrowed, partially-initialized buffer" safely and eliminates the cast. The hard lock-free concurrency `unsafe` lives inside `ringbuf`, not here.
+The crate sets `#![deny(unsafe_code)]`. Its `unsafe` is confined to the read side: a `MaybeUninit<u8>` → `&mut [u8]` cast that lets `Read::read` write straight into the ring buffer (avoiding a second copy through a temporary), the matching `advance_write_index` that publishes exactly the bytes just read, and a one-time memset that zeroes the ring's storage at construction. Together these mean nothing trusts the wrapped source: the cast never exposes uninitialized memory (std requires the *caller* of `Read::read` to pass initialized buffers), and the source's reported byte count is bounds-checked before it is used. All three sites are documented in full where they occur, and the read-loop pair will be removed once [`std::io::BorrowedBuf`](https://github.com/rust-lang/rust/issues/117693) stabilizes, which expresses "borrowed, partially-initialized buffer" safely and eliminates the cast. The hard lock-free concurrency `unsafe` lives inside `ringbuf`, not here.
 
 ## License
 
