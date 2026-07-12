@@ -289,6 +289,23 @@ impl ReadAhead {
         Self { consumer, io_thread, shared, join: Some(join) }
     }
 
+    /// Number of bytes read ahead and ready to serve without blocking.
+    ///
+    /// A point-in-time snapshot: the IO thread appends concurrently, so the
+    /// value may have grown by the time you act on it; it only shrinks
+    /// through this reader's own `read`/`consume`. Useful for tuning
+    /// `ring_bytes` — if this is frequently `0` under load, the source (or
+    /// the ring size) is the bottleneck.
+    pub fn buffered(&self) -> usize {
+        self.consumer.occupied_len()
+    }
+
+    /// The ring's actual capacity in bytes (`ring_bytes` after the 64 KiB
+    /// floor).
+    pub fn capacity(&self) -> usize {
+        self.consumer.capacity().get()
+    }
+
     /// Copy the stored IO error, if any, leaving it in the slot (see
     /// [`clone_io_error`]). Idempotent: re-reads keep surfacing the failure
     /// rather than masking it as a clean EOF.
@@ -391,7 +408,7 @@ impl fmt::Debug for ReadAhead {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadAhead")
             .field("io_thread", &self.io_thread.name())
-            .field("buffered", &self.consumer.occupied_len())
+            .field("buffered", &self.buffered())
             .field("eof", &self.shared.eof.load(Ordering::Relaxed))
             .field("has_error", &lock_or_recover(&self.shared.error).is_some())
             .finish_non_exhaustive()
@@ -501,6 +518,24 @@ impl<W> WriteBehind<W> {
         // The IO thread returns the sink on every non-panicking exit, and a
         // panic latches an error, which returned above.
         dst.ok_or_else(|| io::Error::other("IO thread exited without returning the sink"))
+    }
+
+    /// Number of bytes accepted by `write` but not yet handed to the sink.
+    ///
+    /// A point-in-time snapshot: the IO thread drains concurrently, so the
+    /// value may have shrunk by the time you act on it; it only grows
+    /// through this writer's own `write`. After a successful
+    /// [`flush`](Write::flush) it is `0`. Useful for tuning `ring_bytes` —
+    /// if this hovers near [`capacity`](Self::capacity) under load, the sink
+    /// (or the ring size) is the bottleneck.
+    pub fn pending(&self) -> usize {
+        self.producer.occupied_len()
+    }
+
+    /// The ring's actual capacity in bytes (`ring_bytes` after the 64 KiB
+    /// floor).
+    pub fn capacity(&self) -> usize {
+        self.producer.capacity().get()
     }
 
     /// Copy the stored IO error, if any, leaving it in the slot (see
@@ -613,7 +648,7 @@ impl<W> fmt::Debug for WriteBehind<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WriteBehind")
             .field("io_thread", &self.io_thread.name())
-            .field("pending", &self.producer.occupied_len())
+            .field("pending", &self.pending())
             .field("finished", &self.shared.finished.load(Ordering::Relaxed))
             .field("has_error", &lock_or_recover(&self.shared.error).is_some())
             .finish_non_exhaustive()
@@ -2497,6 +2532,60 @@ mod tests {
             }
         }
         assert_eq!(out, payload);
+    }
+
+    /// `capacity` reports the floored ring size; `buffered` tracks read-ahead
+    /// and drains to zero at end-of-stream.
+    #[test]
+    fn reader_introspection_reports_ring_state() {
+        let payload = vec![7u8; 10_000];
+        let mut r = ReadAhead::new(Cursor::new(payload.clone()), 0);
+        assert_eq!(r.capacity(), 64 * 1024, "capacity is the floored ring size");
+        // The IO thread fills the ring concurrently; wait (bounded) until the
+        // whole payload — which fits the ring — has been read ahead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while r.buffered() < payload.len() {
+            assert!(std::time::Instant::now() < deadline, "read-ahead never buffered the payload");
+            thread::yield_now();
+        }
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(r.buffered(), 0, "everything buffered was consumed");
+    }
+
+    /// `pending` counts bytes not yet handed to the sink — exactly the whole
+    /// payload while the sink is blocked in its first write (the IO thread
+    /// only retires ring bytes after the sink accepts them) — and is zero
+    /// after a successful flush.
+    #[test]
+    fn writer_introspection_reports_ring_state() {
+        /// Blocks each write until the gate sender is dropped.
+        struct GatedSink {
+            gate: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for GatedSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let _ = self.gate.recv(); // blocks until the sender drops
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let payload = vec![9u8; 10_000];
+        let mut w = WriteBehind::new(GatedSink { gate: gate_rx }, 0);
+        assert_eq!(w.capacity(), 64 * 1024, "capacity is the floored ring size");
+        w.write_all(&payload).unwrap();
+        // Deterministic: the IO thread is either not yet draining or blocked
+        // inside the sink's first write; ring bytes are only retired after
+        // the sink accepts them, so everything written is still pending.
+        assert_eq!(w.pending(), payload.len());
+        drop(gate_tx); // open the gate: recv() errors and writes proceed
+        w.flush().unwrap();
+        assert_eq!(w.pending(), 0, "a successful flush leaves nothing pending");
     }
 
     /// Construct and immediately drop both adapters — before the IO thread
