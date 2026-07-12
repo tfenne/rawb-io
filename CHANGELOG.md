@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Ring-occupancy introspection for tuning ring sizes: `ReadAhead::buffered()` (bytes read ahead and ready to serve), `WriteBehind::pending()` (bytes accepted but not yet handed to the sink; `0` after a successful `flush`), and `capacity()` on both (the actual ring size after the 64 KiB floor).
+
 ## [0.1.0] - 2026-07-12
 
 Initial release.
