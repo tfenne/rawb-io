@@ -707,6 +707,15 @@ fn zeroed_ring(capacity: usize) -> (HeapProd<u8>, HeapCons<u8>) {
     let rb = HeapRb::<u8>::new(capacity);
     let (mut producer, consumer) = rb.split();
     let (first, second) = producer.vacant_slices_mut();
+    // The zeroing below is only sound if these two slices are the whole
+    // allocation. On a fresh ring vacant == capacity by construction; assert
+    // it so a change in ringbuf's behavior fails loudly here rather than
+    // silently reintroducing uninitialized "vacant" bytes.
+    assert_eq!(
+        first.len() + second.len(),
+        capacity,
+        "fresh ring's vacant slices must cover its whole storage"
+    );
     // SAFETY: writing zeroes through the vacant `MaybeUninit` slices is the
     // canonical way to initialize such memory, and on a fresh ring the two
     // vacant slices cover exactly the whole allocation. The write index is
@@ -1141,6 +1150,18 @@ mod tests {
         assert!(all_errored, "every write after a surfaced error must error, not succeed");
     }
 
+    /// Drive `iters` fresh writers through the surfaced-error + re-entrant
+    /// write sequence (one IO-thread lifetime per iteration), failing on any
+    /// deadlock. Shared by the default stress test and its soak variant.
+    fn reentrant_write_stress(iters: usize) {
+        for i in 0..iters {
+            let all_errored =
+                run_or_detect_deadlock(|| reentrant_write_after_error_surfaced(64 * 1024))
+                    .unwrap_or_else(|| panic!("iteration {i}: re-entrant write deadlocked"));
+            assert!(all_errored, "iteration {i}: every re-entrant write must surface an error");
+        }
+    }
+
     /// Stress the re-entrant-write path across many IO-thread lifetimes to shake
     /// out the timing-dependent hang. Each iteration spins up a fresh writer +
     /// IO thread, kills it via a failing sink, surfaces the error, then
@@ -1148,19 +1169,15 @@ mod tests {
     /// must hold across all of them.
     ///
     /// Override the iteration count with `REENTRANT_STRESS_ITERS=<n>` to grind
-    /// on it harder (e.g. hundreds of thousands) when auditing the fix locally.
+    /// on it harder (e.g. hundreds of thousands) when auditing the fix locally,
+    /// or run the soak variant.
     #[test]
     fn threaded_writer_reentrant_write_stress_no_deadlock() {
         let iters = std::env::var("REENTRANT_STRESS_ITERS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(REENTRANT_STRESS_ITERS);
-        for i in 0..iters {
-            let all_errored =
-                run_or_detect_deadlock(|| reentrant_write_after_error_surfaced(64 * 1024))
-                    .unwrap_or_else(|| panic!("iteration {i}: re-entrant write deadlocked"));
-            assert!(all_errored, "iteration {i}: every re-entrant write must surface an error");
-        }
+        reentrant_write_stress(iters);
     }
 
     /// A panic inside the IO write thread must not deadlock the producer and
@@ -1328,10 +1345,11 @@ mod tests {
         assert!(result.is_err(), "an IO-thread panic must surface as an error");
     }
 
-    /// Iterations for the panic-masked-as-EOF stress test. Kept modest so the
-    /// default suite stays fast; pre-fix the mask reproduced within a few
-    /// thousand iterations on an M-series laptop.
-    const PANIC_MASK_STRESS_ITERS: usize = 10_000;
+    /// Default iterations for the masked-as-EOF stress tests. Kept modest so
+    /// the default suite stays fast; pre-fix the panic-path mask reproduced
+    /// within a few thousand iterations on an M-series laptop. The soak
+    /// variants run far more.
+    const MASK_STRESS_ITERS: usize = 10_000;
 
     /// What the first `fill_buf` pass of the mask probe observed.
     enum ProbeFirstPass {
@@ -1339,81 +1357,132 @@ mod tests {
         Error,
     }
 
-    /// An IO-thread failure must never surface as a clean EOF. Pre-fix, the
-    /// teardown stored `eof` before the error latch, so a `fill_buf` pass
-    /// racing the teardown could observe (no error, eof) and report a clean
-    /// end-of-stream for a panicked source — silent truncation. This hammers
-    /// fresh readers through that racy teardown; each iteration is one
-    /// Bernoulli trial against the window.
-    ///
-    /// Override the iteration count with `PANIC_MASK_STRESS_ITERS=<n>` to
-    /// grind harder when auditing changes to the shutdown ordering.
-    #[test]
-    fn io_thread_panic_never_masks_as_clean_eof() {
-        // Silence the default panic-hook output for the IO threads this test
-        // kills by the thousand; forward everything else (test assertions
-        // included) to the previous hook. Never restored: the filter is
-        // transparent for non-probe threads, so leaving it installed is
-        // harmless even when tests share a process.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let from_probe = thread::current().name().is_some_and(|n| n.starts_with("mask-probe"));
-            if !from_probe {
-                previous(info);
-            }
-        }));
-
-        /// Serves one byte, then panics after a swept spin delay so some
-        /// fraction of iterations lands the teardown inside the consumer's
-        /// fill_buf window.
-        struct OneByteThenSpinPanic {
-            served: bool,
-            spins: u32,
-        }
-        impl Read for OneByteThenSpinPanic {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                if !self.served {
-                    self.served = true;
-                    buf[0] = 42;
-                    return Ok(1);
+    /// Silence the default panic-hook output for the IO threads the mask
+    /// probes kill by the thousand; forward everything else (test assertions
+    /// included) to the previous hook. Installed once and never restored: the
+    /// filter is transparent for non-probe threads, so leaving it in place is
+    /// harmless even when tests share a process.
+    fn silence_mask_probe_panics() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let from_probe =
+                    thread::current().name().is_some_and(|n| n.starts_with("mask-probe"));
+                if !from_probe {
+                    previous(info);
                 }
-                for _ in 0..self.spins {
-                    std::hint::spin_loop();
-                }
-                panic!("boom");
-            }
-        }
+            }));
+        });
+    }
 
-        let iters = std::env::var("PANIC_MASK_STRESS_ITERS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(PANIC_MASK_STRESS_ITERS);
+    /// Drive `iters` fresh readers through a data-then-failure teardown and
+    /// assert the failure is never reported as a clean EOF. `make_source`
+    /// builds a source that serves one byte and then fails after the given
+    /// number of busy-loop spins; sweeping the spin count lands the teardown
+    /// at varying points inside the consumer's `fill_buf` window, so each
+    /// iteration is one Bernoulli trial against the race window.
+    fn assert_failure_never_masks_as_clean_eof<S, F>(make_source: F, iters: usize)
+    where
+        S: Read + Send + 'static,
+        F: Fn(u32) -> S,
+    {
         for i in 0..iters {
             let spins = (i % 3000) as u32;
-            let mut r = ThreadedReader::with_thread_name(
-                OneByteThenSpinPanic { served: false, spins },
-                64 * 1024,
-                "mask-probe",
-            );
+            let mut r =
+                ThreadedReader::with_thread_name(make_source(spins), 64 * 1024, "mask-probe");
             // Pass 1: take the byte. A clean EOF is impossible here (the byte
             // sits in the ring until consumed), so the only outcomes are data
             // or an already-latched error.
             let first = match r.fill_buf() {
                 Ok(b) if !b.is_empty() => ProbeFirstPass::Data,
-                Ok(_) => panic!("iteration {i}: clean EOF before any data from a panicking source"),
+                Ok(_) => panic!("iteration {i}: clean EOF before any data from a failing source"),
                 Err(_) => ProbeFirstPass::Error,
             };
             match first {
                 ProbeFirstPass::Data => r.consume(1),
                 ProbeFirstPass::Error => continue,
             }
-            // Pass 2 races the panic teardown; it must never be a clean EOF.
+            // Pass 2 races the teardown; it must never be a clean EOF.
             let masked_as_clean_eof = matches!(r.fill_buf(), Ok(b) if b.is_empty());
             assert!(
                 !masked_as_clean_eof,
-                "iteration {i}: IO-thread panic surfaced as clean EOF (silent truncation)"
+                "iteration {i}: IO-thread failure surfaced as clean EOF (silent truncation)"
             );
         }
+    }
+
+    /// Serves one byte, then panics after a swept spin delay.
+    struct OneByteThenSpinPanic {
+        served: bool,
+        spins: u32,
+    }
+    impl Read for OneByteThenSpinPanic {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.served {
+                self.served = true;
+                buf[0] = 42;
+                return Ok(1);
+            }
+            for _ in 0..self.spins {
+                std::hint::spin_loop();
+            }
+            panic!("boom");
+        }
+    }
+
+    /// Serves one byte, then errors after a swept spin delay.
+    struct OneByteThenSpinError {
+        served: bool,
+        spins: u32,
+    }
+    impl Read for OneByteThenSpinError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.served {
+                self.served = true;
+                buf[0] = 42;
+                return Ok(1);
+            }
+            for _ in 0..self.spins {
+                std::hint::spin_loop();
+            }
+            Err(io::Error::other("boom"))
+        }
+    }
+
+    /// An IO-thread panic must never surface as a clean EOF. Pre-fix, the
+    /// teardown stored `eof` before the error latch, so a `fill_buf` pass
+    /// racing the teardown could observe (no error, eof) and report a
+    /// panicked source as clean end-of-stream — silent truncation, reproduced
+    /// at ~1/2,750 iterations. Override with `PANIC_MASK_STRESS_ITERS=<n>` or
+    /// run the soak variant.
+    #[test]
+    fn io_thread_panic_never_masks_as_clean_eof() {
+        silence_mask_probe_panics();
+        let iters = std::env::var("PANIC_MASK_STRESS_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MASK_STRESS_ITERS);
+        assert_failure_never_masks_as_clean_eof(
+            |spins| OneByteThenSpinPanic { served: false, spins },
+            iters,
+        );
+    }
+
+    /// A source error must never surface as a clean EOF — the error-path twin
+    /// of the panic mask test (the error is stored before `eof`, and
+    /// `fill_buf` re-checks the latch after observing `eof`). Override with
+    /// `ERROR_MASK_STRESS_ITERS=<n>` or run the soak variant.
+    #[test]
+    fn io_thread_error_never_masks_as_clean_eof() {
+        let iters = std::env::var("ERROR_MASK_STRESS_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MASK_STRESS_ITERS);
+        assert_failure_never_masks_as_clean_eof(
+            |spins| OneByteThenSpinError { served: false, spins },
+            iters,
+        );
     }
 
     /// A `Read` impl that reports more bytes than the buffer holds must not
@@ -1896,46 +1965,53 @@ mod tests {
         assert_eq!(w.finish().unwrap(), payload);
     }
 
-    /// Randomized read/write sizes across many ring wraps, driven by a
-    /// deterministic xorshift so failures reproduce.
-    #[test]
-    fn randomized_chunk_sizes_round_trip() {
-        /// Tiny deterministic PRNG (xorshift32); avoids a dev-dependency.
-        struct XorShift(u32);
-        impl XorShift {
-            fn next_in(&mut self, lo: usize, hi: usize) -> usize {
-                self.0 ^= self.0 << 13;
-                self.0 ^= self.0 >> 17;
-                self.0 ^= self.0 << 5;
-                lo + (self.0 as usize) % (hi - lo)
-            }
+    /// Tiny deterministic PRNG (xorshift32); avoids a dev-dependency.
+    struct XorShift(u32);
+    impl XorShift {
+        fn next_in(&mut self, lo: usize, hi: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            lo + (self.0 as usize) % (hi - lo)
         }
+    }
 
-        struct RandomChunkSource {
-            payload: Vec<u8>,
-            pos: usize,
-            rng: XorShift,
-        }
-        impl Read for RandomChunkSource {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                if self.pos >= self.payload.len() {
-                    return Ok(0);
-                }
-                let n =
-                    self.rng.next_in(1, 17_000).min(buf.len()).min(self.payload.len() - self.pos);
-                buf[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
-                self.pos += n;
-                Ok(n)
+    /// Serves randomly-sized chunks of `payload` per read.
+    struct RandomChunkSource {
+        payload: Vec<u8>,
+        pos: usize,
+        rng: XorShift,
+    }
+    impl Read for RandomChunkSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.payload.len() {
+                return Ok(0);
             }
+            let n = self.rng.next_in(1, 17_000).min(buf.len()).min(self.payload.len() - self.pos);
+            buf[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
         }
+    }
 
-        let payload: Vec<u8> =
-            (0..2_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 9) as u8).collect();
+    /// Round-trip `payload_len` seeded-pseudo-random bytes through a reader
+    /// (random source chunks, random consumer read sizes) and a writer
+    /// (random write sizes), across many wraps of the minimum-size ring.
+    /// Fully deterministic per seed, so failures reproduce.
+    fn randomized_round_trip(seed: u32, payload_len: usize) {
+        let payload: Vec<u8> = (0..payload_len as u32)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 9) as u8)
+            .collect();
+
         let mut r = ThreadedReader::new(
-            RandomChunkSource { payload: payload.clone(), pos: 0, rng: XorShift(0x2545_F491) },
+            RandomChunkSource {
+                payload: payload.clone(),
+                pos: 0,
+                rng: XorShift((seed ^ 0x2545_F491) | 1),
+            },
             64 * 1024,
         );
-        let mut rng = XorShift(0x9E37_79B9);
+        let mut rng = XorShift((seed ^ 0x9E37_79B9) | 1);
         let mut out = Vec::new();
         let mut buf = vec![0u8; 32 * 1024];
         loop {
@@ -1946,16 +2022,334 @@ mod tests {
             }
             out.extend_from_slice(&buf[..n]);
         }
-        assert_eq!(out, payload, "reader corrupted the stream across ring wraps");
+        assert_eq!(out, payload, "reader corrupted the stream across ring wraps (seed {seed})");
 
         let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
-        let mut rng = XorShift(0xB529_7A4D);
+        let mut rng = XorShift((seed ^ 0xB529_7A4D) | 1);
         let mut written = 0;
         while written < payload.len() {
             let n = rng.next_in(1, 40_000).min(payload.len() - written);
             w.write_all(&payload[written..written + n]).unwrap();
             written += n;
         }
-        assert_eq!(w.finish().unwrap(), payload, "writer corrupted the stream across ring wraps");
+        assert_eq!(
+            w.finish().unwrap(),
+            payload,
+            "writer corrupted the stream across ring wraps (seed {seed})"
+        );
+    }
+
+    /// Randomized read/write sizes across many ring wraps, driven by a
+    /// deterministic xorshift so failures reproduce.
+    #[test]
+    fn randomized_chunk_sizes_round_trip() {
+        randomized_round_trip(0, 2_000_000);
+    }
+
+    // ─── Soundness-assumption pins ───────────────────────────────────────────
+
+    /// The soundness of the read loop's cast rests on `zeroed_ring` having
+    /// initialized every byte of storage, which in turn rests on a fresh
+    /// ring's vacant slices covering the whole allocation. Pin that
+    /// assumption (it is also asserted at construction).
+    #[test]
+    fn fresh_ring_vacant_slices_cover_the_whole_allocation() {
+        let (mut producer, _consumer) = zeroed_ring(64 * 1024);
+        let (first, second) = producer.vacant_slices_mut();
+        assert_eq!(first.len() + second.len(), 64 * 1024);
+    }
+
+    /// A source that READS the buffer it is handed before writing it — legal
+    /// for a safe `Read` impl, since std puts the burden of passing
+    /// initialized memory on the *caller*. Exercises multiple ring laps so
+    /// recycled regions are inspected too. Under Miri (this test is on CI's
+    /// curated list) this proves the ring pre-zeroing makes the cast sound;
+    /// under a normal run it checks behavior.
+    #[test]
+    fn source_that_reads_its_buffer_is_sound_and_round_trips() {
+        struct NosySource {
+            remaining: usize,
+        }
+        impl Read for NosySource {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                // Read a prefix of the buffer we were handed (any value is
+                // legal; the fold defeats optimizing the reads away).
+                let inspected: u64 = buf[..buf.len().min(128)].iter().map(|&b| u64::from(b)).sum();
+                let n = buf.len().min(16 * 1024).min(self.remaining);
+                self.remaining -= n;
+                buf[..n].fill((inspected % 251) as u8);
+                Ok(n)
+            }
+        }
+        // 96 000 bytes through the 64 KiB minimum ring = 1.5 laps, so the
+        // source inspects both freshly-zeroed and recycled storage.
+        let mut r = ThreadedReader::new(NosySource { remaining: 96_000 }, 64 * 1024);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), 96_000);
+    }
+
+    // ─── Cross-thread usage patterns ─────────────────────────────────────────
+
+    /// The realistic shared-writer shape: several threads take turns writing
+    /// through a `Mutex<ThreadedWriter>`. Every parked write must be woken no
+    /// matter which thread parked (repeated waiter re-registration), and each
+    /// chunk written under the lock must arrive contiguously.
+    #[test]
+    fn writer_shared_behind_a_mutex_across_threads_round_trips() {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(ThreadedWriter::new(
+            SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(1) },
+            64 * 1024,
+        )));
+        let chunk = 32 * 1024; // half the ring per write: parks happen regularly
+        let workers: Vec<_> = (0..4u8)
+            .map(|tag| {
+                let writer = writer.clone();
+                thread::spawn(move || {
+                    for _ in 0..8 {
+                        let mut w = writer.lock().unwrap();
+                        w.write_all(&vec![tag; chunk]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let writer =
+            std::sync::Arc::into_inner(writer).expect("all workers joined").into_inner().unwrap();
+        writer.finish().unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 4 * 8 * chunk);
+        let mut per_tag = [0usize; 4];
+        for c in received.chunks(chunk) {
+            let tag = c[0];
+            assert!(c.iter().all(|&b| b == tag), "interleaved chunk near tag {tag}");
+            per_tag[tag as usize] += 1;
+        }
+        assert_eq!(per_tag, [8, 8, 8, 8]);
+    }
+
+    /// Move one writer across a chain of threads, each writing its own
+    /// tagged chunk with the ring under pressure: every hop re-registers the
+    /// waiter, and every chunk must arrive in hop order.
+    fn writer_hop_chain(hops: usize, chunk: usize) {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_buffer = received.clone();
+        run_or_detect_deadlock(move || {
+            let mut writer = ThreadedWriter::new(
+                SlowSink { received: sink_buffer, delay: std::time::Duration::from_millis(1) },
+                64 * 1024,
+            );
+            for hop in 0..hops {
+                writer = thread::spawn(move || {
+                    let mut w = writer;
+                    w.write_all(&vec![(hop % 251) as u8; chunk]).unwrap();
+                    w
+                })
+                .join()
+                .unwrap();
+            }
+            writer.finish().unwrap();
+        })
+        .expect("writer deadlocked while hopping across threads");
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), hops * chunk);
+        for (hop, c) in received.chunks(chunk).enumerate() {
+            let tag = (hop % 251) as u8;
+            assert!(c.iter().all(|&b| b == tag), "hop {hop}: chunk corrupted or out of order");
+        }
+    }
+
+    /// Fast variant of the hop chain (the soak variant runs hundreds).
+    #[test]
+    fn writer_hops_across_threads_round_trips() {
+        writer_hop_chain(12, 24 * 1024);
+    }
+
+    // ─── Composition and flush integrity ─────────────────────────────────────
+
+    /// Composing writers must propagate the inner error out through the outer
+    /// `finish()`: the outer IO thread's final flush drives the inner
+    /// writer's real flush, which surfaces the inner sink's failure. (With
+    /// the pre-fix no-op flush, the inner error was swallowed by the inner
+    /// `Drop`.) Also exercises waiter registration from a non-constructing
+    /// thread: the inner writer's flush parks the *outer IO thread*.
+    #[test]
+    fn nested_threaded_writers_propagate_inner_sink_errors() {
+        let result = run_or_detect_deadlock(|| {
+            let inner = ThreadedWriter::new(FailingSink, 64 * 1024);
+            let mut outer = ThreadedWriter::new(inner, 64 * 1024);
+            outer.write_all(&vec![5u8; 8 * 1024]).and_then(|()| outer.finish().map(drop))
+        })
+        .expect("nested writers deadlocked");
+        assert!(result.is_err(), "the inner sink's failure must surface through the outer finish");
+    }
+
+    /// A sink that accepts exactly `remaining` bytes and then fails
+    /// permanently.
+    struct ByteLimitedSink {
+        received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        remaining: usize,
+    }
+    impl Write for ByteLimitedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "sink capacity exhausted"));
+            }
+            let n = buf.len().min(self.remaining);
+            self.received.lock().unwrap().extend_from_slice(&buf[..n]);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `flush()` returning `Ok` must mean every byte written so far has
+    /// reached the sink. Sweep the sink's failure point so it lands at every
+    /// phase of the write/flush cycle; on each successful flush, the sink
+    /// must hold exactly the bytes sent.
+    fn flush_integrity_sweep(failure_points: impl Iterator<Item = usize>) {
+        for limit in failure_points {
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut w = ThreadedWriter::new(
+                ByteLimitedSink { received: received.clone(), remaining: limit },
+                64 * 1024,
+            );
+            let chunk = vec![7u8; 997];
+            let mut sent = 0;
+            for _ in 0..40 {
+                if w.write_all(&chunk).is_err() {
+                    break;
+                }
+                sent += chunk.len();
+                if w.flush().is_err() {
+                    break;
+                }
+                let received_len = received.lock().unwrap().len();
+                assert_eq!(
+                    received_len, sent,
+                    "flush returned Ok with {received_len} of {sent} bytes at the sink \
+                     (sink limit {limit})"
+                );
+            }
+        }
+    }
+
+    /// Fast sweep of the flush-integrity invariant (the soak variant sweeps
+    /// far more failure points).
+    #[test]
+    fn flush_ok_means_all_bytes_delivered() {
+        flush_integrity_sweep((0..40).map(|i| i * 499));
+    }
+
+    /// Debug impls render without deadlocking (they briefly lock the error
+    /// slot) and identify the adapter.
+    #[test]
+    fn debug_impls_render() {
+        let r = ThreadedReader::new(Cursor::new(vec![1u8; 16]), 64 * 1024);
+        assert!(format!("{r:?}").contains("ThreadedReader"));
+        let w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        assert!(format!("{w:?}").contains("ThreadedWriter"));
+    }
+
+    // ─── Soak tests ──────────────────────────────────────────────────────────
+    //
+    // Long-running stress variants, excluded from the default run. Execute
+    // with `cargo ci-soak` (alias for `nextest run --profile soak
+    // --run-ignored ignored-only`); CI runs them on a weekly schedule. A hang
+    // in a soak test is killed and failed by nextest's terminate-after.
+
+    /// Soak: the re-entrant-write deadlock regression across 50k IO-thread
+    /// lifetimes (~1 min).
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_reentrant_write_stress() {
+        reentrant_write_stress(50_000);
+    }
+
+    /// Soak: the panic-masked-as-EOF race probe at 150k iterations.
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_panic_mask_stress() {
+        silence_mask_probe_panics();
+        assert_failure_never_masks_as_clean_eof(
+            |spins| OneByteThenSpinPanic { served: false, spins },
+            150_000,
+        );
+    }
+
+    /// Soak: the error-masked-as-EOF race probe at 150k iterations.
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_error_mask_stress() {
+        assert_failure_never_masks_as_clean_eof(
+            |spins| OneByteThenSpinError { served: false, spins },
+            150_000,
+        );
+    }
+
+    /// Soak: randomized round trips across 32 seeds x 4 MB.
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_randomized_round_trips_across_seeds() {
+        for seed in 1..=32 {
+            randomized_round_trip(seed, 4_000_000);
+        }
+    }
+
+    /// Soak: hundreds of writer thread-hops (waiter re-registration under
+    /// ring pressure).
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_writer_hops_across_threads() {
+        writer_hop_chain(300, 24 * 1024);
+    }
+
+    /// Soak: thousands of construct-on-one-thread / use-on-another cycles
+    /// for both adapters. A hang here is killed and failed by nextest's
+    /// terminate-after.
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_cross_thread_construct_use_cycles() {
+        let payload = vec![0xa5u8; 4096];
+        for _ in 0..8_000 {
+            let reader = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
+            let out = thread::spawn(move || {
+                let mut r = reader;
+                let mut out = Vec::new();
+                r.read_to_end(&mut out).unwrap();
+                out
+            })
+            .join()
+            .unwrap();
+            assert_eq!(out, payload);
+
+            let writer = ThreadedWriter::new(Vec::new(), 64 * 1024);
+            let expected = payload.clone();
+            let sink = thread::spawn(move || {
+                let mut w = writer;
+                w.write_all(&expected).unwrap();
+                w.finish().unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(sink, payload);
+        }
+    }
+
+    /// Soak: the flush-integrity sweep across 600 sink failure points.
+    #[test]
+    #[ignore = "soak — run via cargo ci-soak"]
+    fn soak_flush_integrity_sweep() {
+        flush_integrity_sweep((0..600).map(|i| i * 131));
     }
 }

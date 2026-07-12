@@ -78,6 +78,45 @@ jobs:
           tests::eof_reads_stay_at_eof
           tests::clone_io_error_round_trips_os_errors
           tests::clone_io_error_preserves_kind_and_message
+          tests::fresh_ring_vacant_slices_cover_the_whole_allocation
+          tests::source_that_reads_its_buffer_is_sound_and_round_trips
+      # Re-run the cheapest concurrency tests across 32 scheduling seeds so
+      # Miri's data-race detector sees genuinely different interleavings, not
+      # just its default deterministic schedule.
+      - name: Miri tests (32 scheduling seeds)
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-many-seeds=0..32"
+        run: >
+          cargo +nightly miri test --
+          tests::threaded_reader_round_trip_small
+          tests::zero_length_reads_and_writes_do_not_block
+          tests::eof_reads_stay_at_eof
+
+  # Runs the suite under ThreadSanitizer (nightly, instrumented std) to watch
+  # every atomic and lock — including ringbuf's internals — for data races at
+  # runtime. Stress iteration counts are trimmed: TSan's overhead makes the
+  # default sweeps needlessly slow, and the soak workflow covers volume.
+  # Linux only: TSan is broken on macOS aarch64 hosts (segfaults at startup).
+  # sccache is disabled because the sanitizer RUSTFLAGS defeat the cache.
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
+      RUSTFLAGS: "-Zsanitizer=thread"
+      REENTRANT_STRESS_ITERS: "200"
+      PANIC_MASK_STRESS_ITERS: "1000"
+      ERROR_MASK_STRESS_ITERS: "1000"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (nightly + rust-src)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Unit tests under ThreadSanitizer
+        run: cargo +nightly test --locked --lib -Zbuild-std --target x86_64-unknown-linux-gnu
 
   lint:
     runs-on: ubuntu-latest

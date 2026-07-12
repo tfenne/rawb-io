@@ -1,0 +1,18 @@
+# Nextest configuration. The default profile applies to `cargo ci-test`.
+#
+# For a crate whose primary failure mode is a parked thread that is never
+# woken, a hung test must FAIL fast rather than stall the run for hours:
+# nextest marks a test slow after `period` and kills + fails it after
+# `period * terminate-after`. The slowest default-suite test finishes in
+# ~1.5 s, so 5 minutes is ~200x headroom.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Soak profile for the #[ignore]d long-running stress tests:
+#
+#     cargo ci-soak    # alias: nextest run --profile soak --run-ignored ignored-only
+#
+# Longer kill window so multi-minute soaks (and env-boosted stress runs)
+# fit; anything still running after an hour is genuinely hung.
+[profile.soak]
+slow-timeout = { period = "120s", terminate-after = 30 }

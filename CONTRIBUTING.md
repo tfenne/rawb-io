@@ -59,7 +59,8 @@ The crate is `#![deny(unsafe_code)]` apart from two narrow `#[allow(unsafe_code)
 - Generate test data in code; never commit data files.
 - Name tests after the behavior they assert; prefer many small tests over table-driven ones.
 - The re-entrant-write stress test honours a `REENTRANT_STRESS_ITERS=<n>` environment override — bump it (hundreds of thousands) when auditing a change to the write path locally. The panic-mask stress honours `PANIC_MASK_STRESS_ITERS=<n>` the same way for changes to the shutdown ordering.
-- CI interprets a curated subset of the suite under Miri (small, deterministic tests — Miri interprets every memory access, so the big-payload and timing-sweep tests would take hours). Run it locally with nightly + the miri component using the exact command from `.github/workflows/check.yml`.
+- Long-running stress variants are `#[ignore]`d out of the default run; execute them with `cargo ci-soak`. CI runs them weekly (and on demand) via the Soak workflow, with a nextest terminate-after so a hang fails fast instead of stalling the job.
+- CI interprets a curated subset of the suite under Miri — single-seed, plus 32 scheduling seeds on the cheapest concurrency tests so its data-race detector sees different interleavings (Miri interprets every memory access, so the big-payload and timing-sweep tests would take hours). It also runs the suite under ThreadSanitizer with an instrumented std, which watches every atomic including `ringbuf`'s internals. Both commands are in `.github/workflows/check.yml`; note the TSan run requires Linux (it segfaults at startup on macOS aarch64 hosts, even on empty tests).
 
 ## Adding or upgrading dependencies
 
