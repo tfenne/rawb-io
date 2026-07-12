@@ -26,37 +26,46 @@ rawb-io = "0.1"
 
 `ThreadedReader` implements both `Read` and `BufRead`, so it drops in wherever you already have a reader. The second argument is the ring-buffer size in bytes (floored to 64 KiB).
 
-```rust
+```rust,no_run
 use std::io::Read;
 use rawb_io::ThreadedReader;
 
-let source = std::fs::File::open("input.dat")?;
-// 16 MiB of read-ahead.
-let mut reader = ThreadedReader::new(source, 16 * 1024 * 1024);
+fn main() -> std::io::Result<()> {
+    let source = std::fs::File::open("input.dat")?;
+    // 16 MiB of read-ahead.
+    let mut reader = ThreadedReader::new(source, 16 * 1024 * 1024);
 
-let mut buf = Vec::new();
-reader.read_to_end(&mut buf)?;
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    Ok(())
+}
 ```
 
 ### Write-behind
 
 `ThreadedWriter` implements `Write`. Call `finish()` when you are done: it flushes any buffered bytes, signals the IO thread to drain, joins it, and hands the sink back — this is where a downstream write error surfaces, so prefer it over relying on `Drop`. Getting the sink back means you can, for example, fsync a `File` before renaming it into place.
 
-```rust
+```rust,no_run
 use std::io::Write;
 use rawb_io::ThreadedWriter;
 
-let sink = std::fs::File::create("output.dat")?;
-// 16 MiB of write-behind.
-let mut writer = ThreadedWriter::new(sink, 16 * 1024 * 1024);
+fn main() -> std::io::Result<()> {
+    let sink = std::fs::File::create("output.dat")?;
+    // 16 MiB of write-behind.
+    let mut writer = ThreadedWriter::new(sink, 16 * 1024 * 1024);
 
-writer.write_all(b"...payload...")?;
+    writer.write_all(b"...payload...")?;
 
-// Flush, drain the IO thread, and surface any error it hit.
-writer.finish()?;
+    // Drain the ring, flush the sink, join the IO thread, get the file back.
+    let file = writer.finish()?;
+    file.sync_all()?; // optional: make it durable before a rename
+    Ok(())
+}
 ```
 
-If a `ThreadedWriter` is dropped without `finish()`, it still signals the IO thread and joins it, but any final error is discarded — use `finish()` whenever you care about the outcome.
+If a `ThreadedWriter` is dropped without `finish()`, it still drains the ring into the sink and joins the IO thread, but any final error is discarded — use `finish()` whenever you care about the outcome.
+
+`flush()` honors the `Write::flush` contract: it blocks until every buffered byte has been written to the sink and the sink's own `flush` has completed, so a `write` + `flush` + "signal another process" sequence is safe. Each `flush` costs one ring drain; write-behind resumes with the next `write`.
 
 ### Naming the IO threads
 
@@ -73,6 +82,13 @@ let reader = ThreadedReader::with_thread_name(source, 1 << 20, "decoder");
 ## Error handling
 
 Both adapters surface an IO-thread failure through the normal `io::Result` return values. The failure is *latched*: once the IO thread reports an error (or panics), every subsequent `read` / `write` / `flush` / `finish` returns that error rather than masking it as a clean EOF or a silent success. On the read side the error surfaces only after every successfully-read byte has been delivered, so the consumer sees the same prefix a plain `BufReader` would have produced, then the failure. Transient `ErrorKind::Interrupted` (EINTR) results from the source or sink are the exception: the IO threads retry them, matching std's conventions, instead of latching them as permanent failures. On the write side this is also what prevents a deadlock — a failed writer rejects further writes up front instead of pushing into a ring buffer its already-exited IO thread can never drain. (`io::Error` is `!Clone`, so the latched error is surfaced by reconstruction: OS errors round-trip losslessly by errno; others preserve the kind and message.)
+
+## Blocking and teardown
+
+- `read` / `fill_buf` block until at least one byte is available (or EOF/error). `write` blocks only while the ring is full. `flush` blocks until the ring has drained into the sink and the sink's own `flush` has completed.
+- Both adapters are `Send` and may be constructed on one thread and used from another; blocking calls wake correctly wherever they run.
+- Dropping either adapter joins its IO thread. For the reader this can block until a pending `read` on the source returns — a blocking read can't be cancelled — and any read-ahead still buffered is discarded. Dropping a writer drains the ring into the sink first, but discards any error from that final drain; call `finish()` when the outcome matters.
+- The IO thread writes whatever the ring holds as soon as it wakes, so a slow trickle of small writes becomes equally small sink writes. If the sink has meaningful per-call overhead (an unbuffered `File`, a pipe), wrap it in `std::io::BufWriter` before handing it to `ThreadedWriter` — the final flush at `finish()` flushes the `BufWriter` through.
 
 ## Implementation notes
 

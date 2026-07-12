@@ -44,7 +44,8 @@
 //!
 //! Write-behind: wrap any [`Write`]; `write` returns as soon as the bytes are
 //! buffered, and [`finish`](ThreadedWriter::finish) blocks until the background
-//! thread has flushed everything, surfacing any error it hit.
+//! thread has flushed everything, surfacing any error it hit and handing the
+//! sink back.
 //!
 //! ```
 //! use std::io::Write;
@@ -52,7 +53,8 @@
 //!
 //! let mut writer = ThreadedWriter::new(Vec::new(), 1 << 20);
 //! writer.write_all(b"hello, world").unwrap();
-//! writer.finish().unwrap();
+//! let sink = writer.finish().unwrap();
+//! assert_eq!(sink, b"hello, world");
 //! ```
 //!
 //! # Design choices
@@ -66,6 +68,23 @@
 //!   instead of two (kernel→temp + temp→ring).
 //! * **Symmetric on write**: the caller pushes bytes into the ring directly; the
 //!   IO writer thread drains via `as_slices` + `write_all` + `skip`.
+//!
+//! # Blocking and teardown
+//!
+//! * `read` / `fill_buf` block until at least one byte is available (or
+//!   EOF/error). `write` blocks only while the ring is full. `flush` blocks
+//!   until the ring has drained into the sink *and* the sink's own `flush`
+//!   has completed.
+//! * Both adapters are `Send` and may be constructed on one thread and used
+//!   from another; blocking calls wake correctly wherever they run.
+//! * Dropping either adapter joins its IO thread. For the reader this can
+//!   block until a pending `read` on the source returns — a blocking read
+//!   cannot be cancelled — and any read-ahead still in the ring is
+//!   discarded. Dropping a writer drains the ring into the sink first, but
+//!   *silently discards* any error from that final drain; call
+//!   [`finish`](ThreadedWriter::finish) when the outcome matters.
+//! * A transient [`ErrorKind::Interrupted`](std::io::ErrorKind::Interrupted)
+//!   from the source or sink is retried, not latched.
 //!
 //! # `unsafe`
 //!
@@ -82,12 +101,20 @@
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
+use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
+// Liveness assumption on ringbuf's caching wrappers (`HeapProd`/`HeapCons`,
+// what `split()` returns): observing an apparently full/empty ring refreshes
+// the cached counterpart index, so the park conditions in this crate always
+// act on a fresh boundary state. The round-trip and backpressure tests
+// exercise this continuously; revisit if the ringbuf major version changes.
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
@@ -181,6 +208,10 @@ fn unpark_waiter(waiter: &Mutex<thread::Thread>) {
 /// The reader is `Send`: it may be constructed on one thread and used on
 /// another, and each blocking call wakes correctly regardless of which
 /// thread makes it (see [`register_waiter`]).
+///
+/// Dropping the reader joins the IO thread; if the source is blocked in a
+/// `read` at that moment, the drop blocks until that read returns (a
+/// blocking read cannot be cancelled).
 pub struct ThreadedReader {
     /// Consumer side of the ring buffer; the worker reads bytes from here.
     consumer: HeapCons<u8>,
@@ -200,6 +231,10 @@ impl ThreadedReader {
     /// The IO thread is named `"rawb-io-read"`; use [`with_thread_name`] to label
     /// it after your own component.
     ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the IO thread.
+    ///
     /// [`with_thread_name`]: Self::with_thread_name
     pub fn new<R: Read + Send + 'static>(src: R, ring_bytes: usize) -> Self {
         Self::with_thread_name(src, ring_bytes, DEFAULT_THREAD_PREFIX)
@@ -209,6 +244,11 @@ impl ThreadedReader {
     /// and uses `"{prefix} IO thread panicked"` as the panic-fallback error, so
     /// the thread — and any surfaced IO-thread panic — is labelled after your
     /// component. Behavior is otherwise identical to [`new`](Self::new).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the IO thread, or if `prefix`
+    /// contains an interior NUL byte (thread names are C strings).
     pub fn with_thread_name<R: Read + Send + 'static>(
         src: R,
         ring_bytes: usize,
@@ -243,6 +283,9 @@ impl ThreadedReader {
 }
 
 impl Read for ThreadedReader {
+    /// Copy up to `dst.len()` bytes out of the ring, blocking only while the
+    /// ring is empty and the stream has not ended. An empty `dst` returns
+    /// `Ok(0)` immediately.
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         // An empty destination can't make progress; don't block waiting for
         // bytes the caller can't accept.
@@ -258,6 +301,9 @@ impl Read for ThreadedReader {
 }
 
 impl BufRead for ThreadedReader {
+    /// Return the buffered bytes, blocking while the ring is empty until the
+    /// IO thread delivers data, EOF, or an error. Bytes the source produced
+    /// before failing are served before the error is reported.
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         loop {
             // Serve buffered bytes first: everything the source successfully
@@ -312,11 +358,25 @@ impl BufRead for ThreadedReader {
     }
 }
 
+/// Stops the IO thread and joins it. If the source is blocked in `read`,
+/// this blocks until that read returns — a blocking read cannot be
+/// cancelled. Any read-ahead still in the ring is discarded.
 impl Drop for ThreadedReader {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.io_thread.unpark();
         join_io_thread(self.join.take());
+    }
+}
+
+impl fmt::Debug for ThreadedReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadedReader")
+            .field("io_thread", &self.io_thread.name())
+            .field("buffered", &self.consumer.occupied_len())
+            .field("eof", &self.shared.eof.load(Ordering::Relaxed))
+            .field("has_error", &lock_or_recover(&self.shared.error).is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -327,6 +387,17 @@ impl Drop for ThreadedReader {
 /// The writer is `Send`: it may be constructed on one thread and used on
 /// another, and each blocking call wakes correctly regardless of which
 /// thread makes it (see [`register_waiter`]).
+///
+/// The IO thread writes whatever the ring holds as soon as it wakes, so a
+/// slow trickle of small writes becomes equally small sink writes. If the
+/// sink has meaningful per-call overhead (an unbuffered [`File`], a pipe),
+/// wrap it in [`std::io::BufWriter`] before handing it in; the final flush
+/// at [`finish`](Self::finish) flushes the `BufWriter` through.
+///
+/// Dropping the writer without calling [`finish`](Self::finish) still drains
+/// the ring into the sink, but silently discards any error.
+///
+/// [`File`]: std::fs::File
 pub struct ThreadedWriter<W> {
     /// Producer side of the ring buffer; the worker pushes bytes here.
     producer: HeapProd<u8>,
@@ -348,6 +419,10 @@ impl<W: Write + Send + 'static> ThreadedWriter<W> {
     /// The IO thread is named `"rawb-io-write"`; use [`with_thread_name`] to
     /// label it after your own component.
     ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the IO thread.
+    ///
     /// [`with_thread_name`]: Self::with_thread_name
     pub fn new(dst: W, ring_bytes: usize) -> Self {
         Self::with_thread_name(dst, ring_bytes, DEFAULT_THREAD_PREFIX)
@@ -357,6 +432,11 @@ impl<W: Write + Send + 'static> ThreadedWriter<W> {
     /// and uses `"{prefix} IO thread panicked"` as the panic-fallback error, so
     /// the thread — and any surfaced IO-thread panic — is labelled after your
     /// component. Behavior is otherwise identical to [`new`](Self::new).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the IO thread, or if `prefix`
+    /// contains an interior NUL byte (thread names are C strings).
     pub fn with_thread_name(dst: W, ring_bytes: usize, prefix: &str) -> Self {
         let rb = HeapRb::<u8>::new(ring_bytes.max(64 * 1024));
         let (producer, consumer) = rb.split();
@@ -412,6 +492,10 @@ impl<W> ThreadedWriter<W> {
 }
 
 impl<W> Write for ThreadedWriter<W> {
+    /// Push `buf` into the ring, blocking only while the ring is full; the
+    /// bytes reach the sink asynchronously. A previous IO failure is
+    /// reported up front, and a failure after part of `buf` was consumed is
+    /// reported as `Ok(n)` with the error surfacing on the next call.
     fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
         // Surface any IO-thread error before touching the ring, and only once
         // per call rather than per ring-push iteration (the previous
@@ -489,6 +573,10 @@ impl<W> Write for ThreadedWriter<W> {
     }
 }
 
+/// Signals end-of-stream, drains the ring into the sink, and joins the IO
+/// thread — so dropping can block while the sink accepts the remaining
+/// bytes. Any error from that final drain is *silently discarded*; call
+/// [`finish`](ThreadedWriter::finish) when the outcome matters.
 impl<W> Drop for ThreadedWriter<W> {
     fn drop(&mut self) {
         // If finish() wasn't called, signal anyway so the IO thread can
@@ -497,6 +585,17 @@ impl<W> Drop for ThreadedWriter<W> {
         self.shared.finished.store(true, Ordering::Release);
         self.io_thread.unpark();
         join_io_thread(self.join.take());
+    }
+}
+
+impl<W> fmt::Debug for ThreadedWriter<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThreadedWriter")
+            .field("io_thread", &self.io_thread.name())
+            .field("pending", &self.producer.occupied_len())
+            .field("finished", &self.shared.finished.load(Ordering::Relaxed))
+            .field("has_error", &lock_or_recover(&self.shared.error).is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -835,6 +934,12 @@ fn clone_io_error(e: &io::Error) -> io::Error {
 fn join_io_thread<T>(join: Option<JoinHandle<T>>) -> Option<T> {
     join.and_then(|handle| handle.join().ok())
 }
+
+/// Compile the README's examples as doctests so they cannot rot relative to
+/// the API (blocks marked `no_run` are compiled but not executed).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
 
 #[cfg(test)]
 mod tests {

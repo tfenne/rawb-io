@@ -10,10 +10,20 @@ readme = "README.md"
 homepage = "https://github.com/tfenne/rawb-io"
 repository = "https://github.com/tfenne/rawb-io"
 keywords = ["io", "buffer", "thread", "spsc", "pipe"]
-categories = ["concurrency", "asynchronous"]
-# Keep the CI tree out of the published tarball; everything else is needed to
-# build and use the crate.
-exclude = ["/.github"]
+# "asynchronous" deliberately absent: that category is for async-runtime IO,
+# and this crate is threaded synchronous IO.
+categories = ["concurrency"]
+# Keep CI and maintainer tooling out of the published tarball; what remains
+# (src, README, CHANGELOG, LICENSE) is what a user of the crate needs.
+exclude = [
+    "/.cargo",
+    "/.github",
+    "/CLAUDE.md",
+    "/CONTRIBUTING.md",
+    "/deny.toml",
+    "/release.toml",
+    "/rust-toolchain.toml",
+]
 
 [dependencies]
 ringbuf = "0.5"
