@@ -1,4 +1,5 @@
 [alias]
 ci-test = "nextest run --workspace --locked --no-tests=pass"
+ci-doctest = "test --doc --locked"
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets -- -D warnings"

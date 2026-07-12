@@ -207,7 +207,7 @@ fn unpark_waiter(waiter: &Mutex<thread::Thread>) {
 ///
 /// The reader is `Send`: it may be constructed on one thread and used on
 /// another, and each blocking call wakes correctly regardless of which
-/// thread makes it (see [`register_waiter`]).
+/// thread makes it (see `register_waiter` in the source).
 ///
 /// Dropping the reader joins the IO thread; if the source is blocked in a
 /// `read` at that moment, the drop blocks until that read returns (a
@@ -386,7 +386,7 @@ impl fmt::Debug for ThreadedReader {
 ///
 /// The writer is `Send`: it may be constructed on one thread and used on
 /// another, and each blocking call wakes correctly regardless of which
-/// thread makes it (see [`register_waiter`]).
+/// thread makes it (see `register_waiter` in the source).
 ///
 /// The IO thread writes whatever the ring holds as soon as it wakes, so a
 /// slow trickle of small writes becomes equally small sink writes. If the
@@ -1718,5 +1718,244 @@ mod tests {
         w.write_all(&payload).unwrap();
         let sink = w.finish().expect("finish must succeed");
         assert_eq!(sink, payload);
+    }
+
+    // ─── Shutdown routes, backpressure, and helper coverage ─────────────────
+
+    /// Dropping a reader mid-stream — with the IO thread parked on a full
+    /// ring — must stop the IO thread and join it promptly.
+    #[test]
+    fn reader_drop_mid_stream_does_not_hang() {
+        /// Fills every read completely and never reaches EOF.
+        struct EndlessSource;
+        impl Read for EndlessSource {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                for b in buf.iter_mut() {
+                    *b = 0x5a;
+                }
+                Ok(buf.len())
+            }
+        }
+        run_or_detect_deadlock(|| {
+            let mut r = ThreadedReader::new(EndlessSource, 64 * 1024);
+            let mut buf = [0u8; 1024];
+            r.read_exact(&mut buf).unwrap();
+            // Give the IO thread time to refill the ring and park on it.
+            thread::sleep(std::time::Duration::from_millis(50));
+            drop(r);
+        })
+        .expect("dropping a mid-stream reader hung");
+    }
+
+    /// Dropping a writer without `finish()` must still drain the ring into
+    /// the sink — only error *reporting* is forfeited, not the data.
+    #[test]
+    fn writer_drop_without_finish_flushes_ring_to_sink() {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let payload = vec![3u8; 100_000];
+        {
+            let mut w = ThreadedWriter::new(
+                SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(1) },
+                1 << 20, // ring holds the whole payload: the drop must drain it
+            );
+            w.write_all(&payload).unwrap();
+        } // dropped here without finish()
+        assert_eq!(*received.lock().unwrap(), payload, "drop must drain the ring to the sink");
+    }
+
+    /// Payload much larger than the ring against a slow sink: the producer
+    /// parks for space repeatedly and every byte still arrives in order —
+    /// the success analog of the failing-sink deadlock tests.
+    #[test]
+    fn slow_sink_backpressure_round_trip() {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 31) as u8).collect();
+        let mut w = ThreadedWriter::new(
+            SlowSink { received: received.clone(), delay: std::time::Duration::from_millis(2) },
+            64 * 1024,
+        );
+        w.write_all(&payload).unwrap();
+        w.finish().unwrap();
+        assert_eq!(*received.lock().unwrap(), payload);
+    }
+
+    /// A source that trickles small delayed chunks: the consumer parks for
+    /// data repeatedly and still sees every byte in order.
+    #[test]
+    fn slow_source_round_trip() {
+        struct TricklingSource {
+            payload: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for TricklingSource {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.payload.len() {
+                    return Ok(0);
+                }
+                thread::sleep(std::time::Duration::from_millis(2));
+                let n = buf.len().min(4096).min(self.payload.len() - self.pos);
+                buf[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let payload: Vec<u8> =
+            (0..64 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+        let mut r =
+            ThreadedReader::new(TricklingSource { payload: payload.clone(), pos: 0 }, 64 * 1024);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// EOF is terminal and stable: after the stream ends, further reads and
+    /// fill_bufs keep reporting end-of-stream.
+    #[test]
+    fn eof_reads_stay_at_eof() {
+        let mut r = ThreadedReader::new(Cursor::new(b"tail".to_vec()), 64 * 1024);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"tail");
+        let mut buf = [0u8; 8];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        assert!(r.fill_buf().unwrap().is_empty());
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    /// Chaining the two adapters (reader → copy → writer) round-trips.
+    #[test]
+    fn chained_reader_writer_round_trip() {
+        let payload: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 64 * 1024);
+        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        std::io::copy(&mut r, &mut w).unwrap();
+        let sink = w.finish().unwrap();
+        assert_eq!(sink, payload);
+    }
+
+    /// `with_thread_name` labels the write-side IO thread (the read side has
+    /// its own test above).
+    #[test]
+    fn with_thread_name_labels_the_write_io_thread() {
+        struct NameCapturingSink {
+            thread_name: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        }
+        impl Write for NameCapturingSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let mut slot = self.thread_name.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(thread::current().name().unwrap_or("<unnamed>").to_string());
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let thread_name = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut w = ThreadedWriter::with_thread_name(
+            NameCapturingSink { thread_name: thread_name.clone() },
+            64 * 1024,
+            "my-stage",
+        );
+        w.write_all(b"name probe").unwrap();
+        w.finish().unwrap();
+        assert_eq!(thread_name.lock().unwrap().as_deref(), Some("my-stage-write"));
+    }
+
+    /// `clone_io_error` round-trips an OS error losslessly (errno + kind).
+    #[test]
+    fn clone_io_error_round_trips_os_errors() {
+        let original = io::Error::from_raw_os_error(2); // ENOENT / ERROR_FILE_NOT_FOUND
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.raw_os_error(), original.raw_os_error());
+        assert_eq!(cloned.kind(), original.kind());
+    }
+
+    /// `clone_io_error` preserves kind and message for non-OS errors.
+    #[test]
+    fn clone_io_error_preserves_kind_and_message() {
+        let original = io::Error::new(io::ErrorKind::InvalidData, "truncated header");
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(cloned.to_string(), original.to_string());
+    }
+
+    /// `ring_bytes` below the floor still works — floored to 64 KiB, not
+    /// rejected.
+    #[test]
+    fn tiny_ring_bytes_floors_and_round_trips() {
+        let payload: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        let mut r = ThreadedReader::new(Cursor::new(payload.clone()), 0);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+
+        let mut w = ThreadedWriter::new(Vec::new(), 1);
+        w.write_all(&payload).unwrap();
+        assert_eq!(w.finish().unwrap(), payload);
+    }
+
+    /// Randomized read/write sizes across many ring wraps, driven by a
+    /// deterministic xorshift so failures reproduce.
+    #[test]
+    fn randomized_chunk_sizes_round_trip() {
+        /// Tiny deterministic PRNG (xorshift32); avoids a dev-dependency.
+        struct XorShift(u32);
+        impl XorShift {
+            fn next_in(&mut self, lo: usize, hi: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 17;
+                self.0 ^= self.0 << 5;
+                lo + (self.0 as usize) % (hi - lo)
+            }
+        }
+
+        struct RandomChunkSource {
+            payload: Vec<u8>,
+            pos: usize,
+            rng: XorShift,
+        }
+        impl Read for RandomChunkSource {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.payload.len() {
+                    return Ok(0);
+                }
+                let n =
+                    self.rng.next_in(1, 17_000).min(buf.len()).min(self.payload.len() - self.pos);
+                buf[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let payload: Vec<u8> =
+            (0..2_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 9) as u8).collect();
+        let mut r = ThreadedReader::new(
+            RandomChunkSource { payload: payload.clone(), pos: 0, rng: XorShift(0x2545_F491) },
+            64 * 1024,
+        );
+        let mut rng = XorShift(0x9E37_79B9);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let want = rng.next_in(1, buf.len());
+            let n = r.read(&mut buf[..want]).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, payload, "reader corrupted the stream across ring wraps");
+
+        let mut w = ThreadedWriter::new(Vec::new(), 64 * 1024);
+        let mut rng = XorShift(0xB529_7A4D);
+        let mut written = 0;
+        while written < payload.len() {
+            let n = rng.next_in(1, 40_000).min(payload.len() - written);
+            w.write_all(&payload[written..written + n]).unwrap();
+            written += n;
+        }
+        assert_eq!(w.finish().unwrap(), payload, "writer corrupted the stream across ring wraps");
     }
 }

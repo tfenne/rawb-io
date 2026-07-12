@@ -18,8 +18,15 @@ jobs:
   # MSRV users. `rust-toolchain.toml` pins `stable` for local dev, so we
   # override it for this job via `RUSTUP_TOOLCHAIN`. Lint/format stay on
   # stable (clippy/rustfmt track the latest toolchain).
+  #
+  # The matrix covers all three OS families: this crate is park/unpark
+  # concurrency, and thread-parker and pipe semantics differ per platform.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
       RUSTUP_TOOLCHAIN: "1.89.0"
     steps:
@@ -35,6 +42,42 @@ jobs:
         uses: taiki-e/install-action@e4b21e1a4de672bc0de96fc2afab9d8081b1d622 # nextest
       - name: Unit tests
         run: cargo ci-test
+      - name: Doc tests
+        run: cargo ci-doctest
+
+  # Interprets a curated subset of the suite under Miri to check the crate's
+  # unsafe sites (the ring-zeroing memset, the MaybeUninit cast, and the
+  # bounds-checked advance_write_index) plus the park/unpark protocol for UB.
+  # The subset sticks to small deterministic tests: Miri interprets every
+  # memory access, so the big-payload and timing-sweep tests would take hours.
+  # sccache is disabled here because cargo-miri installs its own rustc wrapper.
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain (nightly + miri)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Miri tests
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: >
+          cargo +nightly miri test --
+          tests::threaded_reader_round_trip_small
+          tests::threaded_reader_round_trip_larger_than_ring
+          tests::threaded_writer_round_trip_with_finish
+          tests::reader_error_latch_preserves_kind_and_is_idempotent
+          tests::flush_propagates_to_the_sink
+          tests::zero_length_reads_and_writes_do_not_block
+          tests::eof_reads_stay_at_eof
+          tests::clone_io_error_round_trips_os_errors
+          tests::clone_io_error_preserves_kind_and_message
 
   lint:
     runs-on: ubuntu-latest

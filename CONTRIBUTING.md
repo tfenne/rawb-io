@@ -21,12 +21,13 @@ cargo build --release    # release build
 
 ## Verification Checklist
 
-Run all four before sending a PR. CI runs the same gates.
+Run all five before sending a PR. CI runs the same gates (plus a Miri job; see Testing).
 
 ```sh
 cargo ci-fmt      # rustfmt --check
 cargo ci-lint     # clippy --all-targets -D warnings
 cargo ci-test     # nextest, --locked
+cargo ci-doctest  # doctests (nextest does not run them)
 cargo deny check  # licenses, advisories, bans, sources
 ```
 
@@ -46,18 +47,19 @@ rawb-io follows the [Rust API Guidelines][rust-api] and a few project-local rule
 
 ## The concurrency code is load-bearing
 
-`src/lib.rs` encodes fixes for a production deadlock and for IO-thread panics (see `CLAUDE.md` for the specifics). The error latch, the `PanicGuard`, the up-front error re-checks in `ThreadedWriter::write`, and the `park`/`unpark` blocking are invariants, not style choices. Changes on the IO path must preserve their exact behavior and keep the in-module tests green — those tests are the regression suite for the fixes. When in doubt, open an issue before refactoring.
+`src/lib.rs` encodes fixes for production deadlocks, shutdown races, and IO-thread panics (see `CLAUDE.md` for the full inventory). In particular: the write-once error latch; the waiter-slot wake protocol (register → re-check → park on the user side; change state → read slot → unpark on the IO side); the error-before-EOF publication order and `fill_buf`'s latch re-check after observing EOF; the `catch_unwind` panic boundary around each IO loop; the flush epoch handshake; and the up-front + post-park error re-checks in `ThreadedWriter::write`. These are invariants, not style choices. Changes on the IO path must preserve their exact behavior and keep the in-module tests green — those tests are the regression suite for the fixes. When in doubt, open an issue before refactoring.
 
 ## `unsafe`
 
-The crate is `#![deny(unsafe_code)]` apart from a single narrow `#[allow(unsafe_code)]` on the read loop (the `MaybeUninit` → `&mut [u8]` cast and its `advance_write_index`). New `unsafe` is not accepted without a strong justification and a complete `SAFETY:` write-up; prefer a safe alternative.
+The crate is `#![deny(unsafe_code)]` apart from two narrow `#[allow(unsafe_code)]` sites: the read loop (the `MaybeUninit` → `&mut [u8]` cast and its bounds-checked `advance_write_index`) and `zeroed_ring` (the one-time construction memset that keeps the cast sound by guaranteeing the ring's storage is always initialized). New `unsafe` is not accepted without a strong justification and a complete `SAFETY:` write-up; `clippy::undocumented_unsafe_blocks` is warn-level to keep the discipline. Prefer a safe alternative.
 
 ## Testing
 
-- **In-module unit tests** (`#[cfg(test)] mod tests`) cover round-trips, error surfacing, deadlock/panic regressions, and thread naming.
+- **In-module unit tests** (`#[cfg(test)] mod tests`) cover round-trips, error surfacing, deadlock/panic regressions, backpressure, shutdown routes, and thread naming. README examples compile as doctests via a `#[cfg(doctest)]` include hook.
 - Generate test data in code; never commit data files.
 - Name tests after the behavior they assert; prefer many small tests over table-driven ones.
-- The re-entrant-write stress test honours a `REENTRANT_STRESS_ITERS=<n>` environment override — bump it (hundreds of thousands) when auditing a change to the write path locally.
+- The re-entrant-write stress test honours a `REENTRANT_STRESS_ITERS=<n>` environment override — bump it (hundreds of thousands) when auditing a change to the write path locally. The panic-mask stress honours `PANIC_MASK_STRESS_ITERS=<n>` the same way for changes to the shutdown ordering.
+- CI interprets a curated subset of the suite under Miri (small, deterministic tests — Miri interprets every memory access, so the big-payload and timing-sweep tests would take hours). Run it locally with nightly + the miri component using the exact command from `.github/workflows/check.yml`.
 
 ## Adding or upgrading dependencies
 

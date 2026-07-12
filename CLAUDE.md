@@ -8,31 +8,37 @@ Guidance for Claude (or any coding agent) working in this repo. Human-facing con
 
 ## The concurrency code is load-bearing — do not "clean it up"
 
-`src/lib.rs` encodes hard-won fixes for a production deadlock (a downstream sink dying on `ENOSPC` hung a released binary for hours) and for IO-thread panics. Treat the following as invariants, not style choices, and preserve their exact behavior:
+`src/lib.rs` encodes hard-won fixes for production deadlocks (a downstream sink dying on `ENOSPC` hung a released binary for hours; adapters moved across threads parked forever), for shutdown races (an IO-thread failure surfacing as a clean EOF), and for IO-thread panics. Treat the following as invariants, not style choices, and preserve their exact behavior:
 
 - The **write-once / read-many error latch**: the `Mutex<Option<io::Error>>` slot is *never drained*. Its presence is the sticky "this end has failed" state. `peek_error` copies (`clone_io_error`) rather than takes.
-- The **`PanicGuard`**: on a panicking unwind it wakes the counterpart and records a fallback error (and sets `eof` on the read side). Removing or narrowing it reintroduces the hang.
-- The up-front error re-check in `ThreadedWriter::write` (both before the loop and after `park`): this is what breaks the deadlock. Do not move it back inside the push loop.
-- `park` / `unpark` blocking, `lock_or_recover` poison handling, and the `Drop` / `finish` semantics.
+- The **waiter-slot wake protocol**: user-side park sites do register (`register_waiter`) → re-check the park condition → `park`; the IO thread does change state → read the slot → unpark (`unpark_waiter`). The slot mutex's release/acquire edge is what makes a wakeup during cross-thread migration impossible to lose. Never capture a `Thread` handle at construction for user-side wakeups — that deadlocks adapters moved between threads.
+- The **error-before-EOF publication order**: every reader failure path (including the panic boundary) stores the error latch strictly *before* setting `eof`, and `fill_buf` re-checks the latch after observing `eof`. This pairing is what prevents a failure surfacing as a clean EOF (silent truncation).
+- **Buffered data is served before the terminal state**: `fill_buf` consults `eof`/error only once the ring is empty. Liveness holds because every reader error also sets `eof`.
+- The **`catch_unwind` panic boundary** (`io_read_thread` / `io_write_thread`): latches the panic's message as the error (before `eof` on the read side) and wakes the waiter on every exit. Removing or narrowing it reintroduces the hang.
+- The **up-front error check and post-park re-check in `ThreadedWriter::write`**: this is what breaks the `ENOSPC` deadlock. Do not move them back inside the push loop. A partially-consumed `write` that hits the latch returns `Ok(n)`, not `Err` (the `Write` contract).
+- The **flush epoch handshake** (`flush_seq` / `flush_ack`): the IO thread loads the requested epoch *before* its empty-check and acks only after draining and `dst.flush()`; `flush()` parks until the ack or the error latch fires.
+- `ErrorKind::Interrupted` (EINTR) from the source, or from the sink's flush, is retried — never latched.
+- `lock_or_recover` poison handling, and the `Drop` / `finish` semantics (drop drains the writer but swallows errors; `finish` returns the sink).
 
-If you think a simplification is warranted, stop and ask — behavior must stay equivalent, and the tests in `src/lib.rs` are the regression suite for these fixes. Run the stress test with a large `REENTRANT_STRESS_ITERS` when touching anything on the write path.
+If you think a simplification is warranted, stop and ask — behavior must stay equivalent, and the tests in `src/lib.rs` are the regression suite for these fixes. Run the stress tests with large `REENTRANT_STRESS_ITERS` / `PANIC_MASK_STRESS_ITERS` overrides when touching the write path or the shutdown ordering.
 
 ## `unsafe`
 
-The crate is `#![deny(unsafe_code)]` with a single narrow `#[allow(unsafe_code)]` on `io_read_loop`, covering the `MaybeUninit<u8>` → `&mut [u8]` cast and the matching `advance_write_index`. Keep `unsafe` confined there, keep the `SAFETY:` write-up complete, and do not add `unsafe` elsewhere.
+The crate is `#![deny(unsafe_code)]` with two narrow `#[allow(unsafe_code)]` sites: `io_read_loop` (the `MaybeUninit<u8>` → `&mut [u8]` cast and the bounds-checked `advance_write_index`) and `zeroed_ring` (the one-time construction memset that keeps the cast sound by guaranteeing the ring's storage is always initialized). Keep `unsafe` confined there, keep the `SAFETY:` write-ups complete, and do not add `unsafe` elsewhere. Never feed the source's reported byte count to `advance_write_index` unchecked, and never build the reader's ring without the zeroing.
 
 ## Before calling any change done
 
-Run all four gates and make them pass — these are exactly what CI runs:
+Run all five gates and make them pass — these are exactly what CI runs:
 
 ```
-cargo ci-fmt     # rustfmt --check
-cargo ci-lint    # clippy --all-targets -D warnings
-cargo ci-test    # nextest, --locked
-cargo deny check # licenses, advisories, bans, sources
+cargo ci-fmt      # rustfmt --check
+cargo ci-lint     # clippy --all-targets -D warnings
+cargo ci-test     # nextest, --locked
+cargo ci-doctest  # doctests (nextest does not run them)
+cargo deny check  # licenses, advisories, bans, sources
 ```
 
-The `ci-*` aliases live in `.cargo/config.toml`. If `ci-fmt` fails, run `cargo fmt`.
+The `ci-*` aliases live in `.cargo/config.toml`. If `ci-fmt` fails, run `cargo fmt`. CI also runs the test matrix on Linux/macOS/Windows and a curated Miri subset (`.github/workflows/check.yml`).
 
 ## Workflow — this repo is PUBLIC
 
