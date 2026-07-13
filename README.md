@@ -108,6 +108,15 @@ The minimum supported Rust version is **1.89**.
 
 The crate sets `#![deny(unsafe_code)]`. Its `unsafe` is confined to the read side: a `MaybeUninit<u8>` → `&mut [u8]` cast that lets `Read::read` write straight into the ring buffer (avoiding a second copy through a temporary), the matching `advance_write_index` that publishes exactly the bytes just read, and a one-time memset that zeroes the ring's storage at construction. Together these mean nothing trusts the wrapped source: the cast never exposes uninitialized memory (std requires the *caller* of `Read::read` to pass initialized buffers), and the source's reported byte count is bounds-checked before it is used. All three sites are documented in full where they occur, and the read-loop pair will be removed once [`std::io::BorrowedBuf`](https://github.com/rust-lang/rust/issues/117693) stabilizes, which expresses "borrowed, partially-initialized buffer" safely and eliminates the cast. The hard lock-free concurrency `unsafe` lives inside `ringbuf`, not here.
 
+## Verification
+
+Concurrency bugs rarely show up in ordinary tests: the schedule that triggers one may occur once in millions of runs on your machine and constantly on someone else's. So beyond the unit/regression suites and a three-OS CI matrix, two heavyweight tools run on every pull request:
+
+- **[Miri](https://github.com/rust-lang/miri)**, the Rust interpreter, executes a curated subset of the suite instruction-by-instruction to check the crate's `unsafe` sites and atomics for undefined behavior and data races — including runs across 32 scheduling seeds, so its race detector sees genuinely different interleavings and weak-memory behaviors rather than one lucky schedule.
+- **[loom](https://github.com/tokio-rs/loom)**, a model checker for concurrent Rust, runs six models of the crate's blocking protocols (parking and wakeups, error latching, the flush handshake, teardown) under **every admissible thread interleaving, exhaustively** — including the stale-value reads the C11 memory model permits on weakly-ordered hardware. A lost wakeup, deadlock, or mis-ordered publication in any explored schedule fails CI with a replayable trace. The models exercise the real `ringbuf` ring, rebuilt from checksum-verified crates.io sources with loom's instrumented atomics (see `scripts/loom.sh`), not a hand-written test double.
+
+[ThreadSanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html) additionally watches every atomic at runtime — including `ringbuf`'s internals and the ring's byte storage, which the loom models deliberately leave to it — and the long-running stress tiers run weekly as soaks.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright © 2026 Tim Fennell.
