@@ -38,7 +38,7 @@ cargo ci-doctest  # doctests (nextest does not run them)
 cargo deny check  # licenses, advisories, bans, sources
 ```
 
-The `ci-*` aliases live in `.cargo/config.toml`. If `ci-fmt` fails, run `cargo fmt`. CI additionally runs the test matrix on Linux/macOS/Windows, a curated Miri subset (single-seed plus 32-seed scheduling exploration), and a ThreadSanitizer pass (`.github/workflows/check.yml`), plus a weekly soak workflow for the `#[ignore]`d stress tests. Run the soaks locally with `cargo ci-soak` after touching any concurrency path; TSan requires Linux (broken on macOS aarch64 hosts).
+The `ci-*` aliases live in `.cargo/config.toml`. If `ci-fmt` fails, run `cargo fmt`. CI additionally runs the test matrix on Linux/macOS/Windows, a curated Miri subset (single-seed plus 32-seed scheduling exploration), a ThreadSanitizer pass, and an exhaustive loom model-checking job (`.github/workflows/check.yml`), plus a weekly soak workflow for the `#[ignore]`d stress tests. Run the soaks locally with `cargo ci-soak` after touching any concurrency path — and `scripts/loom.sh` as well when the change touches the park/wake/latch protocols (the script's header documents how it patches checksum-verified ringbuf/loom sources); TSan requires Linux (broken on macOS aarch64 hosts).
 
 ## Workflow — this repo is PUBLIC
 

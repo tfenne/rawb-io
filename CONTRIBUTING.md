@@ -61,17 +61,18 @@ The crate is `#![deny(unsafe_code)]` apart from two narrow `#[allow(unsafe_code)
 - The re-entrant-write stress test honours a `REENTRANT_STRESS_ITERS=<n>` environment override — bump it (hundreds of thousands) when auditing a change to the write path locally. The panic-mask stress honours `PANIC_MASK_STRESS_ITERS=<n>` the same way for changes to the shutdown ordering.
 - Long-running stress variants are `#[ignore]`d out of the default run; execute them with `cargo ci-soak`. CI runs them weekly (and on demand) via the Soak workflow, with a nextest terminate-after so a hang fails fast instead of stalling the job.
 - CI interprets a curated subset of the suite under Miri — single-seed, plus 32 scheduling seeds on the cheapest concurrency tests so its data-race detector sees different interleavings (Miri interprets every memory access, so the big-payload and timing-sweep tests would take hours). It also runs the suite under ThreadSanitizer with an instrumented std, which watches every atomic including `ringbuf`'s internals. Both commands are in `.github/workflows/check.yml`; note the TSan run requires Linux (it segfaults at startup on macOS aarch64 hosts, even on empty tests).
+- The loom models (`#[cfg(all(test, loom))] mod loom_tests` in `src/lib.rs`) model-check the park/wake/latch protocols across every admissible thread interleaving — including the stale-value reads C11 weak memory permits — with the real `ringbuf` index protocol in the loop: `scripts/loom.sh` rebuilds checksum-verified `ringbuf` and `loom` releases with two small patches (documented in the script's header) and points the build at them. CI runs the models exhaustively (no preemption bound) on every PR; run `scripts/loom.sh` locally after touching any protocol code, with `LOOM_MAX_PREEMPTIONS=0` for the exhaustive exploration.
 
 ## Adding or upgrading dependencies
 
-rawb-io deliberately has a single runtime dependency (`ringbuf`) and no dev-dependencies. A new direct dependency needs a clear justification in the PR and a `cargo deny check` pass; new licenses get added to `deny.toml`'s allow-list only after deliberate review (no copyleft).
+rawb-io deliberately has a single runtime dependency (`ringbuf`) and no dev-dependencies. The one carve-out is `loom`, declared under `[target.'cfg(loom)'.dependencies]`: it compiles only when `scripts/loom.sh` sets `RUSTFLAGS="--cfg loom"` for model-checking builds and is never part of a normal build, `cargo test` included. A new direct dependency needs a clear justification in the PR and a `cargo deny check` pass; new licenses get added to `deny.toml`'s allow-list only after deliberate review (no copyleft).
 
 ## Pull Requests
 
 - Keep PRs focused. Commit messages explain *why*; the "what" is in the diff.
 - Each PR should include tests for the behavior it adds or changes.
 - Update `CHANGELOG.md`'s `[Unreleased]` section with a one-line entry in the appropriate subsection (Added / Changed / Fixed / Removed).
-- All four CI gates must be green before merge.
+- Every CI check must be green before merge.
 
 ## Releasing
 

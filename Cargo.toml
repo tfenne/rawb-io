@@ -26,5 +26,17 @@ exclude = [
     "/rust-toolchain.toml",
 ]
 
+[lints.rust]
+# `--cfg loom` is set only by scripts/loom.sh (model-checking builds); declare
+# it so normal rustc/clippy runs don't reject the cfg under -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
 [dependencies]
 ringbuf = "0.5"
+
+# Compiled ONLY under `RUSTFLAGS="--cfg loom"` (scripts/loom.sh): loom's
+# instrumented primitives replace std's via the `sync_shim` module so the
+# park/wake/latch protocols can be model-checked across all interleavings.
+# Normal builds — `cargo test` included — never compile this.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"

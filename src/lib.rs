@@ -115,9 +115,10 @@
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
+
+use crate::sync_shim::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync_shim::thread::{self, JoinHandle};
+use crate::sync_shim::{Arc, Mutex, MutexGuard};
 
 // Liveness assumption on ringbuf's caching wrappers (`HeapProd`/`HeapCons`,
 // what `split()` returns): observing an apparently full/empty ring refreshes
@@ -126,6 +127,31 @@ use std::thread::{self, JoinHandle};
 // exercise this continuously; revisit if the ringbuf major version changes.
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+
+// ─── Concurrency-primitive routing (std ↔ loom) ──────────────────────────────
+
+/// Single source for every cross-thread primitive the adapters use.
+///
+/// Normal builds re-export std unchanged, so routing through this module has
+/// zero effect on shipped behavior. Under `--cfg loom` (set only by
+/// `scripts/loom.sh`) the same names resolve to loom's instrumented replicas,
+/// so the model checker can drive and exhaustively check the park/wake/latch
+/// protocols. This module must only ever contain re-exports: any logic here
+/// would run in one build but not the other.
+#[cfg(not(loom))]
+mod sync_shim {
+    pub(crate) use std::sync::atomic;
+    pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
+    pub(crate) use std::thread;
+}
+
+/// loom's replicas of the primitives; see the `not(loom)` twin above.
+#[cfg(loom)]
+mod sync_shim {
+    pub(crate) use loom::sync::atomic;
+    pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
+    pub(crate) use loom::thread;
+}
 
 /// Default prefix for the spawned IO threads' names and their panic-fallback
 /// error message. [`ReadAhead::new`] and [`WriteBehind::new`] use this;
@@ -1045,7 +1071,10 @@ mod readme_doctests {}
 #[cfg(doctest)]
 mod send_sync_pins {}
 
-#[cfg(test)]
+// The std test suite exercises the adapters on real OS threads; under
+// `--cfg loom` the shim's primitives only function inside `loom::model`, so
+// these tests are compiled out and `loom_tests` below takes over.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -2689,5 +2718,212 @@ mod tests {
     #[ignore = "soak — run via cargo ci-soak"]
     fn soak_flush_integrity_sweep() {
         flush_integrity_sweep((0..600).map(|i| i * 131));
+    }
+}
+
+// ─── loom models ─────────────────────────────────────────────────────────────
+
+/// Model-checked executions of the crate's blocking protocols, run only via
+/// `scripts/loom.sh` (never part of a normal `cargo test`). Each test wraps
+/// one protocol scenario in `loom::model`, which runs it under every schedule
+/// loom's preemption bound admits — including the stale-value reads C11 weak
+/// memory allows — and fails on any deadlock (a lost wakeup parks forever),
+/// panic, or assertion failure, printing the schedule that triggered it.
+/// Sources and sinks are deterministic; the scheduler is the only
+/// nondeterminism, as loom requires.
+///
+/// Ring capacities look huge (the constructors floor `ring_bytes` to 64 KiB)
+/// but cost the model nothing: ring bytes move via plain memcpys the checker
+/// never interleaves; only the index atomics, mutexes, and park/unpark are
+/// modeled operations. "Fill the ring" is therefore one modeled push, not
+/// 64 Ki of them.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A source that serves `data`, then fails with `err_msg`.
+    struct FailingSource {
+        data: &'static [u8],
+        pos: usize,
+        err_msg: &'static str,
+    }
+
+    impl Read for FailingSource {
+        fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+            if self.pos < self.data.len() {
+                let n = dst.len().min(self.data.len() - self.pos);
+                dst[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            } else {
+                Err(io::Error::other(self.err_msg))
+            }
+        }
+    }
+
+    /// A source whose first `read` panics, exercising the catch_unwind
+    /// boundary in `io_read_thread`.
+    struct PanickingSource;
+
+    impl Read for PanickingSource {
+        fn read(&mut self, _dst: &mut [u8]) -> io::Result<usize> {
+            panic!("kaboom-probe");
+        }
+    }
+
+    /// A sink that rejects every write, so the ring never drains — the
+    /// setup for the production ENOSPC deadlock the `write` error checks fix.
+    struct FailingSink;
+
+    impl Write for FailingSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("sink refused"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A sink recording everything it accepts and each `flush` call.
+    #[derive(Default)]
+    struct RecordingSink {
+        data: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    /// Silence the default panic-hook output for the probe panics the models
+    /// throw once per explored execution; forward everything else (assertion
+    /// failures included) to the previous hook. Keyed on the payload rather
+    /// than the thread name (as the std suite's filter is) because loom's
+    /// threads all report the host test thread's name.
+    fn silence_probe_panics() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let from_probe = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .is_some_and(|message| message.contains("kaboom-probe"));
+                if !from_probe {
+                    previous(info);
+                }
+            }));
+        });
+    }
+
+    /// The scenario behind `register_waiter`: construct on one thread, read
+    /// on another. In every schedule the migrated reader's parks must be
+    /// woken by the IO thread — a wake aimed at the construction thread (the
+    /// original cross-thread bug) parks the reader forever, which loom
+    /// reports as a deadlock with the schedule that produced it.
+    #[test]
+    fn reader_migrated_across_threads_drains_to_eof() {
+        loom::model(|| {
+            let reader = ReadAhead::new(Cursor::new(vec![7u8, 8]), 1);
+            thread::spawn(move || {
+                let mut reader = reader;
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).expect("read_to_end");
+                assert_eq!(out, [7, 8]);
+            })
+            .join()
+            .expect("reader thread");
+        });
+    }
+
+    /// A source failure after data must surface as that error — never as a
+    /// clean EOF (silent truncation) — and the bytes produced before the
+    /// failure must be served first, under every interleaving of the IO
+    /// thread's latch-then-eof publication with the reader's checks.
+    #[test]
+    fn reader_source_error_never_reads_as_clean_eof() {
+        loom::model(|| {
+            let mut reader =
+                ReadAhead::new(FailingSource { data: b"z", pos: 0, err_msg: "boom-probe" }, 1);
+            let mut out = Vec::new();
+            let err = reader.read_to_end(&mut out).expect_err("source failed");
+            assert_eq!(out, b"z", "bytes before the failure are served first");
+            assert!(err.to_string().contains("boom-probe"), "got: {err}");
+        });
+    }
+
+    /// An IO-thread panic must latch as the error (message preserved), set
+    /// EOF after it, and wake the reader — never hang it, never read as a
+    /// clean EOF. Exercises the catch_unwind boundary under all schedules.
+    #[test]
+    fn reader_io_thread_panic_latches_error_and_wakes() {
+        silence_probe_panics();
+        loom::model(|| {
+            let mut reader = ReadAhead::new(PanickingSource, 1);
+            let mut buf = [0u8; 4];
+            let err = reader.read(&mut buf).expect_err("panic must surface");
+            assert!(err.to_string().contains("kaboom-probe"), "got: {err}");
+        });
+    }
+
+    /// The production ENOSPC deadlock: the sink dies, the ring is full, and
+    /// the next `write` must surface the latched error instead of parking
+    /// against an IO thread that already exited — whether it observes the
+    /// error up front, at the pre-park re-check, or at the post-park
+    /// re-check. The trailing drop must join cleanly, not hang.
+    #[test]
+    fn writer_full_ring_write_surfaces_sink_error_instead_of_hanging() {
+        loom::model(|| {
+            let mut writer = WriteBehind::new(FailingSink, 1);
+            let fill = vec![0u8; writer.capacity()];
+            assert_eq!(writer.write(&fill).expect("ring accepts the fill"), fill.len());
+            let err = writer.write(&[1]).expect_err("failed writer must reject");
+            assert!(err.to_string().contains("sink refused"), "got: {err}");
+        });
+    }
+
+    /// The same dead-sink/full-ring scenario after migrating the writer to
+    /// another thread: the waiter-slot protocol must aim the error wakeup at
+    /// the thread that is actually parked in `write`, not the constructor's.
+    #[test]
+    fn writer_migrated_across_threads_surfaces_sink_error() {
+        loom::model(|| {
+            let writer = WriteBehind::new(FailingSink, 1);
+            thread::spawn(move || {
+                let mut writer = writer;
+                let fill = vec![0u8; writer.capacity()];
+                writer.write_all(&fill).expect("ring accepts the fill");
+                let err = writer.write(&[1]).expect_err("failed writer must reject");
+                assert!(err.to_string().contains("sink refused"), "got: {err}");
+            })
+            .join()
+            .expect("writer thread");
+        });
+    }
+
+    /// `flush` must not return until every prior byte reached the sink and
+    /// the sink's own `flush` ran (the `flush_seq`/`flush_ack` handshake,
+    /// including the IO loop's seq-load-before-empty-check ordering). After
+    /// a successful flush nothing is pending, and `finish` hands back the
+    /// sink with everything recorded.
+    #[test]
+    fn writer_flush_drains_ring_and_acks_epoch() {
+        loom::model(|| {
+            let mut writer = WriteBehind::new(RecordingSink::default(), 1);
+            writer.write_all(b"ab").expect("write");
+            writer.flush().expect("flush");
+            assert_eq!(writer.pending(), 0, "flush returned with bytes still pending");
+            let sink = writer.finish().expect("finish");
+            assert_eq!(sink.data, b"ab");
+            assert!(sink.flushes >= 1, "sink flush must run before flush() returns");
+        });
     }
 }
