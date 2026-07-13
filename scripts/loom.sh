@@ -51,10 +51,14 @@ lock_field() { # <crate> <field>
 # be byte-identical to what production builds compile, minus our patches.
 vendor_crate() { # <crate> <version> <sha256>
     local name="$1" version="$2" sha="$3" crate_file
-    crate_file=$(find "$CACHE" -name "${name}-${version}.crate" 2>/dev/null | head -1)
+    # `|| true`: on a cold machine (fresh CI runner) the registry cache
+    # directory doesn't exist yet, and under `set -euo pipefail` a bare
+    # failing `find` would kill the script before the `cargo fetch` below
+    # gets a chance to populate it.
+    crate_file=$(find "$CACHE" -name "${name}-${version}.crate" 2>/dev/null | head -1 || true)
     if [[ -z "$crate_file" ]]; then
         cargo fetch --quiet
-        crate_file=$(find "$CACHE" -name "${name}-${version}.crate" 2>/dev/null | head -1)
+        crate_file=$(find "$CACHE" -name "${name}-${version}.crate" 2>/dev/null | head -1 || true)
     fi
     if [[ -z "$crate_file" ]]; then
         echo "error: ${name}-${version}.crate not in the registry cache even after cargo fetch" >&2
