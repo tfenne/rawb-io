@@ -13,8 +13,12 @@
 #     patched to tolerate a stray `Thread::unpark` aimed at a joining thread:
 #     std's `join` is immune to park tokens, but loom 0.7.2 asserts and kills
 #     the model. rawb-io legitimately unparks a thread that may already be
-#     joining (an IO thread's exit wake racing a `Drop`), so without this the
-#     mock diverges from std semantics. Candidate for an upstream report.
+#     joining (an IO thread's exit wake racing a `Drop`). This is
+#     tokio-rs/loom#249 (open since 2022, never fixed). The re-block here is
+#     fit for these models — no joining thread in them parks again afterward —
+#     but it swallows the park token std would preserve, so the std-faithful
+#     upstream fix belongs on the unpark side (only unblock threads blocked in
+#     `park`; bank the token otherwise, as shuttle does).
 #
 # Combined with `RUSTFLAGS="--cfg loom"` (which activates the `sync_shim`
 # loom re-exports and the `loom_tests` module in src/lib.rs), the whole stack
