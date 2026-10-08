@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ring-occupancy introspection for tuning ring sizes: `ReadAhead::buffered()` (bytes read ahead and ready to serve), `WriteBehind::pending()` (bytes accepted but not yet handed to the sink; `0` after a successful `flush`), and `capacity()` on both (the actual ring size after the 64 KiB floor).
 - [loom](https://github.com/tokio-rs/loom) model checking of the park/wake/latch protocols: six models run the real stack — including the actual `ringbuf` index protocol, rebuilt from checksum-verified sources by `scripts/loom.sh` — under exhaustive schedule exploration on every CI run. No API changes; this hardens the guarantees the crate already documents.
 
+### Fixed
+
+- Require `ringbuf` 0.5.3. In `ringbuf` 0.5.2, `skip` takes time proportional to the number of bytes skipped, which cut `ReadAhead` and `WriteBehind` in-memory throughput about 25× (from ~90 GB/s to ~3.5 GB/s). rawb-io 0.1.0 users can pick up the fix with `cargo update -p ringbuf`.
+
 ## [0.1.0] - 2026-07-12
 
 Initial release.
