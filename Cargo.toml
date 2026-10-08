@@ -32,7 +32,8 @@ exclude = [
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [dependencies]
-ringbuf = "0.5"
+# 0.5.2's `Consumer::skip` is O(n) for `u8`, and every byte we move goes through it.
+ringbuf = "0.5.3"
 
 # Compiled ONLY under `RUSTFLAGS="--cfg loom"` (scripts/loom.sh): loom's
 # instrumented primitives replace std's via the `sync_shim` module so the
