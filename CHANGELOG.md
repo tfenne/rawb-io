@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-08
+
 ### Added
 
 - Ring-occupancy introspection for tuning ring sizes: `ReadAhead::buffered()` (bytes read ahead and ready to serve), `WriteBehind::pending()` (bytes accepted but not yet handed to the sink; `0` after a successful `flush`), and `capacity()` on both (the actual ring size after the 64 KiB floor).
@@ -30,5 +32,6 @@ Initial release.
 - Cross-thread friendly: both adapters are `Send` and may be constructed on one thread and used from another (or shared behind a `Mutex`); blocking calls wake correctly wherever they run. Dropping either adapter joins its IO thread; dropping a `WriteBehind` without `finish()` still drains the ring into the sink but discards errors.
 - Soundness hardened against misbehaving-but-safe `Read`/`Write` impls: the ring's storage is initialized at construction (the source is never handed uninitialized memory) and reported byte counts are bounds-checked. Verified in CI under Miri (including 32-seed scheduling exploration) and ThreadSanitizer, on Linux/macOS/Windows, with deadlock-regression, backpressure, and weekly soak test tiers.
 
-[Unreleased]: https://github.com/tfenne/rawb-io/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tfenne/rawb-io/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/tfenne/rawb-io/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tfenne/rawb-io/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 [package]
 name = "rawb-io"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Tim Fennell <tfenne@tfenne.com>"]
 description = "Read-ahead / write-behind byte IO: threaded Reader/Writer that decouples a pipeline stage from the kernel pipe via a background thread and a byte ring buffer."
 edition = "2024"
